@@ -1,1 +1,1202 @@
+name: Build BlockBlastAuto Dylib
 
+on:
+  push:
+    paths-ignore:
+      - 'BlockBlastAuto.dylib'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios-dylib:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ldid signer
+        run: brew install ldid
+
+      - name: Write and Compile BlockBlastAuto.mm
+        run: |
+          cat << 'EOF' > BlockBlastAuto.mm
+          #import <UIKit/UIKit.h>
+          #import <Foundation/Foundation.h>
+          #import <CoreGraphics/CoreGraphics.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <objc/runtime.h>
+          #import <objc/message.h>
+          #include <cstdint>
+          #include <vector>
+          #include <array>
+          #include <string>
+          #include <algorithm>
+          #include <cmath>
+          #include <atomic>
+
+          namespace BBAuto {
+
+          enum class PlayStrategy : int { AUTO_COMBO = 0, MAX_SURVIVAL = 1, AUTO_MODE = 2 };
+          enum class EngineRunState : int { STOPPED = 0, AUTO_PLAYING = 1, GUIDE_PLAYING = 2 };
+
+          struct PieceShape {
+              int slotIndex = -1, rows = 0, cols = 0, cellCount = 0;
+              uint32_t localMask = 0;
+              bool valid = false;
+              float centerNormX = 0.0f, centerNormY = 0.0f;
+              bool getCell(int r, int c) const {
+                  if (r < 0 || r >= rows || c < 0 || c >= cols) return false;
+                  return (localMask >> (r * 5 + c)) & 1U;
+              }
+              void setCell(int r, int c, bool val) {
+                  if (r < 0 || r >= 5 || c < 0 || c >= 5) return;
+                  if (val) localMask |= (1U << (r * 5 + c));
+                  else localMask &= ~(1U << (r * 5 + c));
+              }
+          };
+
+          struct PlacementMove {
+              int slotIndex = -1;
+              PieceShape piece;
+              int targetRow = 0, targetCol = 0;
+              uint64_t rawMaskOnBoard = 0ULL, expectedBoardAfter = 0ULL;
+              int linesCleared = 0;
+              bool valid = false;
+          };
+
+          struct TurnPlan {
+              std::vector<PlacementMove> moves;
+              double totalScore = -1e18;
+              int totalLinesCleared = 0, validSequencesFound = 0;
+              PlayStrategy activeStrategy = PlayStrategy::AUTO_MODE;
+              bool feasible = false;
+          };
+
+          struct CalibrationConfig {
+              float boardX = 0.054f, boardY = 0.235f, boardW = 0.892f;
+              float dockX = 0.035f, dockY = 0.686f, dockW = 0.930f, dockH = 0.160f;
+              float dockCellScale = 0.45f;
+              float dragLiftOffsetY = 112.0f;
+              float dragSpeedMultiplier = 0.85f;
+              float dragGainX = 1.25f, dragGainY = 1.25f;
+              float autoBiasRow = 0.0f, autoBiasCol = 0.0f;
+              bool showCalibrationOverlay = false;
+          };
+
+          struct RuntimeTelemetry {
+              int turnsExecuted = 0, movesExecuted = 0, totalLinesCleared = 0;
+              int currentCombo = 0, movesSinceLastClear = 0, lastValidSequences = 0;
+              uint64_t lastDetectedBoard = 0ULL;
+              std::array<PieceShape, 3> lastDetectedDock;
+              bool hasActiveGuideMove = false;
+              PlacementMove currentGuideMove;
+              int guideStepIndex = 0, guideTotalSteps = 0;
+              PlayStrategy requestedStrategy = PlayStrategy::AUTO_MODE;
+              PlayStrategy effectiveStrategy = PlayStrategy::AUTO_COMBO;
+              std::string statusMessage = "San sang";
+          };
+
+          inline int popcount64(uint64_t x) { return __builtin_popcountll(x); }
+
+          class BlockSolver {
+          public:
+              BlockSolver() { initThreatMasks(); }
+
+              static uint64_t computePlacementMask(const PieceShape& piece, int targetRow, int targetCol) {
+                  uint64_t mask = 0ULL;
+                  for (int r = 0; r < piece.rows; ++r)
+                      for (int c = 0; c < piece.cols; ++c)
+                          if (piece.getCell(r, c))
+                              mask |= (1ULL << ((targetRow + r) * 8 + (targetCol + c)));
+                  return mask;
+              }
+
+              static uint64_t simulatePlacement(uint64_t board, uint64_t pieceMask, int& outLinesCleared) {
+                  uint64_t nextBoard = board | pieceMask, clearMask = 0ULL;
+                  outLinesCleared = 0;
+                  for (int r = 0; r < 8; ++r) {
+                      uint64_t rowMask = 0xFFULL << (r * 8);
+                      if ((nextBoard & rowMask) == rowMask) { clearMask |= rowMask; outLinesCleared++; }
+                  }
+                  for (int c = 0; c < 8; ++c) {
+                      uint64_t colMask = 0x0101010101010101ULL << c;
+                      if ((nextBoard & colMask) == colMask) { clearMask |= colMask; outLinesCleared++; }
+                  }
+                  return nextBoard & ~clearMask;
+              }
+
+              TurnPlan solveTurn(uint64_t currentBoard, const std::vector<PieceShape>& availablePieces,
+                                 int currentCombo, int movesSinceLastClear, PlayStrategy strategyMode) {
+                  TurnPlan bestPlan;
+                  std::vector<PieceShape> activePieces;
+                  for (const auto& p : availablePieces)
+                      if (p.valid && p.rows > 0 && p.cols > 0 && p.localMask != 0) activePieces.push_back(p);
+
+                  int N = static_cast<int>(activePieces.size());
+                  if (N == 0) return bestPlan;
+
+                  PlayStrategy effectiveStrategy = strategyMode;
+                  if (strategyMode == PlayStrategy::AUTO_MODE) {
+                      int occupied = popcount64(currentBoard);
+                      int currentFit3x3 = countFittingMasks(currentBoard, m_threatMasks.square3x3);
+                      effectiveStrategy = (occupied >= 38 || currentFit3x3 <= 1) ? PlayStrategy::MAX_SURVIVAL : PlayStrategy::AUTO_COMBO;
+                  }
+                  bestPlan.activeStrategy = effectiveStrategy;
+
+                  std::vector<int> perm(N);
+                  for (int i = 0; i < N; ++i) perm[i] = i;
+
+                  struct SearchNode {
+                      uint64_t board;
+                      std::array<PlacementMove, 3> moves;
+                      std::array<int, 3> clearAtStep;
+                      int totalCleared = 0;
+                      double interimScore = 0.0;
+                  };
+
+                  constexpr int BEAM_WIDTH = 96;
+                  int totalValidFullSequences = 0, maxPartialDepth = 0;
+                  TurnPlan fallbackPartialPlan;
+
+                  do {
+                      std::vector<SearchNode> currentBeam = {{currentBoard, {}, {0, 0, 0}, 0, 0.0}};
+                      for (int step = 0; step < N; ++step) {
+                          const PieceShape& piece = activePieces[perm[step]];
+                          std::vector<SearchNode> nextBeam;
+                          nextBeam.reserve(currentBeam.size() * 32);
+                          int maxR = 8 - piece.rows, maxC = 8 - piece.cols;
+
+                          for (const auto& node : currentBeam) {
+                              for (int r = 0; r <= maxR; ++r) {
+                                  for (int c = 0; c <= maxC; ++c) {
+                                      uint64_t mask = computePlacementMask(piece, r, c);
+                                      if ((node.board & mask) != 0ULL) continue;
+                                      int cleared = 0;
+                                      uint64_t nextBoard = simulatePlacement(node.board, mask, cleared);
+                                      SearchNode child = node;
+                                      child.board = nextBoard;
+                                      child.clearAtStep[step] = cleared;
+                                      child.totalCleared = node.totalCleared + cleared;
+                                      child.moves[step] = {piece.slotIndex, piece, r, c, mask, nextBoard, cleared, true};
+                                      child.interimScore = evaluateState(nextBoard, child.totalCleared, child.clearAtStep,
+                                                                         step + 1, currentCombo, movesSinceLastClear, effectiveStrategy);
+                                      nextBeam.push_back(child);
+                                  }
+                              }
+                          }
+                          if (nextBeam.empty()) { currentBeam.clear(); break; }
+                          if (step + 1 > maxPartialDepth) {
+                              maxPartialDepth = step + 1;
+                              const auto& bestInterim = *std::max_element(nextBeam.begin(), nextBeam.end(),
+                                  [](const SearchNode& a, const SearchNode& b) { return a.interimScore < b.interimScore; });
+                              fallbackPartialPlan.moves.assign(bestInterim.moves.begin(), bestInterim.moves.begin() + (step + 1));
+                              fallbackPartialPlan.totalScore = bestInterim.interimScore;
+                              fallbackPartialPlan.totalLinesCleared = bestInterim.totalCleared;
+                              fallbackPartialPlan.feasible = true;
+                          }
+                          if (step < N - 1 && static_cast<int>(nextBeam.size()) > BEAM_WIDTH) {
+                              std::partial_sort(nextBeam.begin(), nextBeam.begin() + BEAM_WIDTH, nextBeam.end(),
+                                  [](const SearchNode& a, const SearchNode& b) { return a.interimScore > b.interimScore; });
+                              nextBeam.resize(BEAM_WIDTH);
+                          }
+                          currentBeam = std::move(nextBeam);
+                      }
+                      totalValidFullSequences += static_cast<int>(currentBeam.size());
+                      for (const auto& leaf : currentBeam) {
+                          if (leaf.interimScore > bestPlan.totalScore) {
+                              bestPlan.totalScore = leaf.interimScore;
+                              bestPlan.totalLinesCleared = leaf.totalCleared;
+                              bestPlan.moves.assign(leaf.moves.begin(), leaf.moves.begin() + N);
+                              bestPlan.feasible = true;
+                          }
+                      }
+                  } while (std::next_permutation(perm.begin(), perm.end()));
+
+                  if (!bestPlan.feasible && fallbackPartialPlan.feasible) bestPlan = fallbackPartialPlan;
+                  bestPlan.validSequencesFound = totalValidFullSequences;
+                  return bestPlan;
+              }
+
+          private:
+              struct PrecomputedThreatMasks {
+                  std::vector<uint64_t> square3x3, line5H, line5V, corner3x3;
+              } m_threatMasks;
+
+              void initThreatMasks() {
+                  for (int r = 0; r <= 5; ++r)
+                      for (int c = 0; c <= 5; ++c) {
+                          uint64_t m = 0;
+                          for (int dr = 0; dr < 3; ++dr)
+                              for (int dc = 0; dc < 3; ++dc) m |= (1ULL << ((r + dr) * 8 + (c + dc)));
+                          m_threatMasks.square3x3.push_back(m);
+                          uint64_t topRow = (7ULL << (r * 8 + c)), botRow = (7ULL << ((r + 2) * 8 + c));
+                          uint64_t leftCol = (1ULL << (r * 8 + c)) | (1ULL << ((r + 1) * 8 + c)) | (1ULL << ((r + 2) * 8 + c));
+                          uint64_t rightCol = (1ULL << (r * 8 + c + 2)) | (1ULL << ((r + 1) * 8 + c + 2)) | (1ULL << ((r + 2) * 8 + c + 2));
+                          m_threatMasks.corner3x3.push_back(topRow | leftCol);
+                          m_threatMasks.corner3x3.push_back(topRow | rightCol);
+                          m_threatMasks.corner3x3.push_back(botRow | leftCol);
+                          m_threatMasks.corner3x3.push_back(botRow | rightCol);
+                      }
+                  for (int r = 0; r < 8; ++r)
+                      for (int c = 0; c <= 3; ++c) {
+                          uint64_t m = 0;
+                          for (int dc = 0; dc < 5; ++dc) m |= (1ULL << (r * 8 + (c + dc)));
+                          m_threatMasks.line5H.push_back(m);
+                      }
+                  for (int r = 0; r <= 3; ++r)
+                      for (int c = 0; c < 8; ++c) {
+                          uint64_t m = 0;
+                          for (int dr = 0; dr < 5; ++dr) m |= (1ULL << ((r + dr) * 8 + c));
+                          m_threatMasks.line5V.push_back(m);
+                      }
+              }
+
+              int countFittingMasks(uint64_t board, const std::vector<uint64_t>& masks) const {
+                  int count = 0;
+                  for (uint64_t m : masks) if ((board & m) == 0ULL) count++;
+                  return count;
+              }
+
+              int countTransitions(uint64_t board) const {
+                  int transitions = 0;
+                  for (int r = 0; r < 8; ++r) {
+                      uint8_t rowBits = static_cast<uint8_t>((board >> (r * 8)) & 0xFFULL);
+                      uint8_t leftShifted = (rowBits << 1) | 1U;
+                      uint8_t rightEdge = (rowBits & 0x80U) ? 0U : 1U;
+                      transitions += __builtin_popcount(static_cast<unsigned int>(rowBits ^ leftShifted)) + rightEdge;
+                  }
+                  uint64_t topEdgeDiff = ~board & 0xFFULL, botEdgeDiff = (~board >> 56) & 0xFFULL;
+                  uint64_t vertDiff = (board ^ (board << 8)) & ~0xFFULL;
+                  return transitions + popcount64(vertDiff) + popcount64(topEdgeDiff) + popcount64(botEdgeDiff);
+              }
+
+              void analyzeEmptyRegions(uint64_t board, int& outIsolatedHoles, int& outSmallIslands, int& outLargestEmptyRegion) const {
+                  uint64_t emptyMask = ~board, visited = 0ULL;
+                  outIsolatedHoles = outSmallIslands = outLargestEmptyRegion = 0;
+                  constexpr uint64_t NOT_LEFT_COL = 0xFEFEFEFEFEFEFEFEULL, NOT_RIGHT_COL = 0x7F7F7F7F7F7F7F7FULL;
+                  while (emptyMask & ~visited) {
+                      int startBit = __builtin_ctzll(emptyMask & ~visited);
+                      uint64_t component = 1ULL << startBit;
+                      while (true) {
+                          uint64_t expanded = component | ((component << 1) & NOT_LEFT_COL) | ((component >> 1) & NOT_RIGHT_COL) | (component << 8) | (component >> 8);
+                          expanded &= emptyMask;
+                          if (expanded == component) break;
+                          component = expanded;
+                      }
+                      visited |= component;
+                      int regionSize = popcount64(component);
+                      if (regionSize > outLargestEmptyRegion) outLargestEmptyRegion = regionSize;
+                      if (regionSize == 1) outIsolatedHoles++;
+                      else if (regionSize >= 2 && regionSize <= 4) outSmallIslands++;
+                  }
+              }
+
+              double evaluateState(uint64_t finalBoard, int totalLinesCleared, const std::array<int, 3>& clearAtStep,
+                                   int numSteps, int initialCombo, int initialMovesSinceClear, PlayStrategy effectiveStrategy) const {
+                  int occupiedCells = popcount64(finalBoard), emptyCells = 64 - occupiedCells;
+                  int combo = initialCombo, drought = initialMovesSinceClear, comboExtensions = 0, lastClearStepIndex = -1;
+                  bool comboBroken = false;
+                  for (int s = 0; s < numSteps; ++s) {
+                      if (clearAtStep[s] > 0) { combo++; drought = 0; comboExtensions++; lastClearStepIndex = s; }
+                      else if (++drought >= 3 && combo > 0) { combo = 0; comboBroken = true; }
+                  }
+                  int isolatedHoles = 0, smallIslands = 0, largestEmptyRegion = 0;
+                  analyzeEmptyRegions(finalBoard, isolatedHoles, smallIslands, largestEmptyRegion);
+                  int transitions = countTransitions(finalBoard);
+                  int fit3x3 = countFittingMasks(finalBoard, m_threatMasks.square3x3);
+                  int fit5H  = countFittingMasks(finalBoard, m_threatMasks.line5H);
+                  int fit5V  = countFittingMasks(finalBoard, m_threatMasks.line5V);
+                  int fitL3  = countFittingMasks(finalBoard, m_threatMasks.corner3x3);
+
+                  int primedLines = 0;
+                  for (int i = 0; i < 8; ++i) {
+                      int cntR = popcount64((finalBoard >> (i * 8)) & 0xFFULL);
+                      int cntC = popcount64(finalBoard & (0x0101010101010101ULL << i));
+                      primedLines += (cntR == 7 ? 3 : (cntR == 6 ? 1 : 0)) + (cntC == 7 ? 3 : (cntC == 6 ? 1 : 0));
+                  }
+
+                  bool isCombo = (effectiveStrategy == PlayStrategy::AUTO_COMBO);
+                  double score = 0.0;
+                  if (comboExtensions > 0) score += (isCombo ? 2600.0 : 950.0) * comboExtensions + (combo * 320.0) + lastClearStepIndex * (isCombo ? 650.0 : 220.0);
+                  else if (comboBroken) score -= (isCombo ? 3200.0 : 900.0);
+
+                  score += totalLinesCleared * (isCombo ? 820.0 : 1150.0);
+                  for (int s = 0; s < numSteps; ++s)
+                      if (clearAtStep[s] >= 2) score += (clearAtStep[s] * clearAtStep[s]) * (isCombo ? 550.0 : 750.0);
+
+                  score += emptyCells * (isCombo ? 38.0 : 75.0) + largestEmptyRegion * 22.0;
+                  score -= isolatedHoles * (isCombo ? 360.0 : 580.0) + smallIslands * (isCombo ? 240.0 : 420.0) + transitions * (isCombo ? 28.0 : 45.0);
+                  score += primedLines * (isCombo ? 95.0 : 40.0);
+
+                  if (fit3x3 == 0) score -= isCombo ? 2400.0 : 4500.0; else score += std::min(fit3x3, 6) * 140.0;
+                  if (fit5H == 0 && fit5V == 0) score -= isCombo ? 1500.0 : 2800.0; else score += std::min(fit5H + fit5V, 8) * 65.0;
+                  if (fitL3 == 0) score -= 1600.0; else score += std::min(fitL3, 8) * 45.0;
+                  return score;
+              }
+          };
+
+          struct VisionSnapshotResult {
+              bool success = false;
+              uint64_t boardBits = 0ULL;
+              std::vector<PieceShape> dockPieces;
+          };
+
+          class VisionAnalyzer {
+          public:
+              struct RGBAPixel { uint8_t r, g, b, a; };
+
+              static float computeColorDistance(const RGBAPixel& px, float bgR, float bgG, float bgB) {
+                  float dr = px.r - bgR, dg = px.g - bgG, db = px.b - bgB;
+                  return std::sqrt(dr * dr + dg * dg + db * db);
+              }
+
+              static bool captureWindowPixels(UIWindow* gameWindow, UIWindow* overlayWindowToIgnore, int targetWidth, int& outHeight, std::vector<RGBAPixel>& outPixels) {
+                  if (!gameWindow) return false;
+                  __block int bufW = targetWidth, bufH = 0;
+                  __block bool captured = false;
+                  auto captureBlock = ^{
+                      CGSize winSize = gameWindow.bounds.size;
+                      if (winSize.width <= 0 || winSize.height <= 0) return;
+                      bufH = static_cast<int>(std::round(bufW * (winSize.height / winSize.width)));
+                      outPixels.resize(bufW * bufH);
+                      UIGraphicsBeginImageContextWithOptions(CGSizeMake(bufW, bufH), NO, 1.0);
+                      BOOL wasHidden = overlayWindowToIgnore ? overlayWindowToIgnore.hidden : YES;
+                      if (overlayWindowToIgnore) overlayWindowToIgnore.hidden = YES;
+                      [gameWindow drawViewHierarchyInRect:CGRectMake(0, 0, bufW, bufH) afterScreenUpdates:NO];
+                      if (overlayWindowToIgnore) overlayWindowToIgnore.hidden = wasHidden;
+                      UIImage* snapImage = UIGraphicsGetImageFromCurrentImageContext();
+                      UIGraphicsEndImageContext();
+                      if (!snapImage || !snapImage.CGImage) return;
+                      CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+                      CGContextRef ctx = CGBitmapContextCreate(outPixels.data(), bufW, bufH, 8, bufW * 4, colorSpace, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+                      CGContextDrawImage(ctx, CGRectMake(0, 0, bufW, bufH), snapImage.CGImage);
+                      CGContextRelease(ctx);
+                      CGColorSpaceRelease(colorSpace);
+                      captured = true;
+                  };
+                  if ([NSThread isMainThread]) captureBlock();
+                  else dispatch_sync(dispatch_get_main_queue(), captureBlock);
+                  outHeight = bufH;
+                  return captured && !outPixels.empty() && bufH > 0;
+              }
+
+              PieceShape recognizeDockSlot(const std::vector<RGBAPixel>& buffer, int bufW, int bufH, int slotIndex,
+                                           float slotNormX, float slotNormY, float slotNormW, float slotNormH, float expectedDockCellPx) {
+                  PieceShape shape;
+                  shape.slotIndex = slotIndex;
+                  int x0 = std::max(0, static_cast<int>(std::round(slotNormX * bufW)));
+                  int y0 = std::max(0, static_cast<int>(std::round(slotNormY * bufH)));
+                  int x1 = std::min(bufW - 1, static_cast<int>(std::round((slotNormX + slotNormW) * bufW)));
+                  int y1 = std::min(bufH - 1, static_cast<int>(std::round((slotNormY + slotNormH) * bufH)));
+                  if (x1 <= x0 + 6 || y1 <= y0 + 6) return shape;
+
+                  float sumBgR = 0, sumBgG = 0, sumBgB = 0; int bgSamples = 0;
+                  for (int x = x0 + 3; x <= x1 - 3; x += 4) {
+                      const RGBAPixel& pTop = buffer[(y0 + 3) * bufW + x];
+                      const RGBAPixel& pBot = buffer[(y1 - 3) * bufW + x];
+                      sumBgR += pTop.r + pBot.r; sumBgG += pTop.g + pBot.g; sumBgB += pTop.b + pBot.b;
+                      bgSamples += 2;
+                  }
+                  float bgR = bgSamples ? sumBgR / bgSamples : 43.0f, bgG = bgSamples ? sumBgG / bgSamples : 62.0f, bgB = bgSamples ? sumBgB / bgSamples : 129.0f;
+                  constexpr float DOCK_FG_DIST_THRESHOLD = 26.0f;
+                  int minFgX = x1, maxFgX = x0, minFgY = y1, maxFgY = y0, fgCount = 0;
+                  for (int y = y0 + 4; y <= y1 - 4; ++y)
+                      for (int x = x0 + 4; x <= x1 - 4; ++x)
+                          if (computeColorDistance(buffer[y * bufW + x], bgR, bgG, bgB) > DOCK_FG_DIST_THRESHOLD) {
+                              minFgX = std::min(minFgX, x); maxFgX = std::max(maxFgX, x);
+                              minFgY = std::min(minFgY, y); maxFgY = std::max(maxFgY, y);
+                              fgCount++;
+                          }
+
+                  float fgBoxW = static_cast<float>(maxFgX - minFgX + 1), fgBoxH = static_cast<float>(maxFgY - minFgY + 1);
+                  if (fgCount < 18 || fgBoxW < expectedDockCellPx * 0.50f || fgBoxH < expectedDockCellPx * 0.50f) return shape;
+
+                  shape.cols = std::clamp(static_cast<int>(std::round(fgBoxW / expectedDockCellPx)), 1, 5);
+                  shape.rows = std::clamp(static_cast<int>(std::round(fgBoxH / expectedDockCellPx)), 1, 5);
+                  float cellStepW = fgBoxW / shape.cols, cellStepH = fgBoxH / shape.rows;
+
+                  for (int r = 0; r < shape.rows; ++r) {
+                      for (int c = 0; c < shape.cols; ++c) {
+                          int cx = static_cast<int>(std::round(minFgX + (c + 0.5f) * cellStepW));
+                          int cy = static_cast<int>(std::round(minFgY + (r + 0.5f) * cellStepH));
+                          int activeSamples = 0, totalSamples = 0, radius = std::max(2, static_cast<int>(std::min(cellStepW, cellStepH) * 0.28f));
+                          for (int dy = -radius; dy <= radius; ++dy)
+                              for (int dx = -radius; dx <= radius; ++dx) {
+                                  totalSamples++;
+                                  if (computeColorDistance(buffer[std::clamp(cy + dy, y0, y1) * bufW + std::clamp(cx + dx, x0, x1)], bgR, bgG, bgB) > DOCK_FG_DIST_THRESHOLD)
+                                      activeSamples++;
+                              }
+                          if (activeSamples * 10 >= totalSamples * 3) { shape.setCell(r, c, true); shape.cellCount++; }
+                      }
+                  }
+                  shape.valid = (shape.cellCount > 0);
+                  shape.centerNormX = ((minFgX + maxFgX) * 0.5f) / bufW;
+                  shape.centerNormY = ((minFgY + maxFgY) * 0.5f) / bufH;
+                  return shape;
+              }
+
+              VisionSnapshotResult analyzeCurrentScreen(UIWindow* gameWindow, UIWindow* overlayWindowToIgnore, const CalibrationConfig& config) {
+                  VisionSnapshotResult result;
+                  int bufW = 360, bufH = 0;
+                  std::vector<RGBAPixel> pixels;
+                  if (!captureWindowPixels(gameWindow, overlayWindowToIgnore, bufW, bufH, pixels)) return result;
+
+                  float boardPxX = config.boardX * bufW, boardPxY = config.boardY * bufH, boardPxW = config.boardW * bufW;
+                  float cellW = boardPxW / 8.0f, cellH = boardPxW / 8.0f;
+                  struct CellSample { float r, g, b, luminance; };
+                  std::array<CellSample, 64> samples;
+                  float minLum = 1000.0f, bgRefR = 26.0f, bgRefG = 35.0f, bgRefB = 74.0f;
+
+                  for (int r = 0; r < 8; ++r) {
+                      for (int c = 0; c < 8; ++c) {
+                          int cx = static_cast<int>(std::round(boardPxX + (c + 0.5f) * cellW));
+                          int cy = static_cast<int>(std::round(boardPxY + (r + 0.5f) * cellH));
+                          float sumR = 0, sumG = 0, sumB = 0; int cnt = 0;
+                          for (int dy = -2; dy <= 2; ++dy)
+                              for (int dx = -2; dx <= 2; ++dx) {
+                                  const RGBAPixel& p = pixels[std::clamp(cy + dy, 0, bufH - 1) * bufW + std::clamp(cx + dx, 0, bufW - 1)];
+                                  sumR += p.r; sumG += p.g; sumB += p.b; cnt++;
+                              }
+                          float avgR = sumR / cnt, avgG = sumG / cnt, avgB = sumB / cnt;
+                          float lum = 0.299f * avgR + 0.587f * avgG + 0.114f * avgB;
+                          samples[r * 8 + c] = {avgR, avgG, avgB, lum};
+                          if (lum < minLum && lum < 52.0f) { minLum = lum; bgRefR = avgR; bgRefG = avgG; bgRefB = avgB; }
+                      }
+                  }
+                  if (minLum > 52.0f) minLum = 37.0f;
+
+                  uint64_t boardBits = 0ULL;
+                  for (int i = 0; i < 64; ++i) {
+                      float dr = samples[i].r - bgRefR, dg = samples[i].g - bgRefG, db = samples[i].b - bgRefB;
+                      if (std::sqrt(dr * dr + dg * dg + db * db) > 42.0f || (samples[i].luminance - minLum) > 26.0f)
+                          boardBits |= (1ULL << i);
+                  }
+
+                  float expectedDockCellPx = cellW * config.dockCellScale, slotW = config.dockW / 3.0f;
+                  result.dockPieces.resize(3);
+                  for (int s = 0; s < 3; ++s)
+                      result.dockPieces[s] = recognizeDockSlot(pixels, bufW, bufH, s, config.dockX + s * slotW, config.dockY, slotW, config.dockH, expectedDockCellPx);
+
+                  result.boardBits = boardBits;
+                  result.success = true;
+                  return result;
+              }
+          };
+
+          } // namespace BBAuto
+
+          @interface UITouch (PrivateSynthesize)
+          - (void)setPhase:(UITouchPhase)phase;
+          - (void)setTapCount:(NSUInteger)tapCount;
+          - (void)setWindow:(UIWindow *)window;
+          - (void)setView:(UIView *)view;
+          - (void)_setLocationInWindow:(CGPoint)location resetPrevious:(BOOL)reset;
+          - (void)_setIsFirstTouchForView:(BOOL)first;
+          - (void)setTimestamp:(NSTimeInterval)timestamp;
+          @end
+
+          @interface UIEvent (PrivateSynthesize)
+          - (void)_addTouch:(UITouch *)touch forDelayedDelivery:(BOOL)delayed;
+          - (void)_clearTouches;
+          @end
+
+          namespace BBAuto {
+
+          class TouchSynthesizer {
+          public:
+              void executeDragMove(UIWindow* targetWindow, const PlacementMove& move, const CalibrationConfig& config, dispatch_block_t completion) {
+                  if (!targetWindow) { if (completion) completion(); return; }
+                  CGSize winSize = targetWindow.bounds.size;
+                  CGFloat startX = move.piece.centerNormX * winSize.width;
+                  CGFloat startY = move.piece.centerNormY * winSize.height;
+
+                  CGFloat boardX = config.boardX * winSize.width;
+                  CGFloat boardY = config.boardY * winSize.height;
+                  CGFloat cellW = (config.boardW * winSize.width) / 8.0;
+
+                  CGFloat targetColWithBias = move.targetCol + move.piece.cols * 0.5 + config.autoBiasCol;
+                  CGFloat targetRowWithBias = move.targetRow + move.piece.rows * 0.5 + config.autoBiasRow;
+
+                  CGFloat targetPieceCenterX = boardX + targetColWithBias * cellW;
+                  CGFloat targetPieceCenterY = boardY + targetRowWithBias * cellW;
+
+                  CGFloat gainX = std::max(0.75f, config.dragGainX);
+                  CGFloat gainY = std::max(0.75f, config.dragGainY);
+
+                  CGFloat rawEndX = startX + (targetPieceCenterX - startX) / gainX;
+                  CGFloat rawEndY = startY + ((targetPieceCenterY + config.dragLiftOffsetY) - startY) / gainY;
+
+                  CGFloat endX = std::clamp<double>(rawEndX, 18.0, winSize.width - 18.0);
+                  CGFloat endY = std::clamp<double>(rawEndY, 55.0, winSize.height - 35.0);
+
+                  CGPoint startPt = CGPointMake(startX, startY);
+                  CGPoint endPt   = CGPointMake(endX, endY);
+
+                  int moveSteps = std::clamp(static_cast<int>(std::round(26.0 / std::clamp(config.dragSpeedMultiplier, 0.3f, 2.0f))), 16, 60);
+                  double dt = 0.013;
+
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      dispatchSingleTouchPhase(targetWindow, startPt, UITouchPhaseBegan);
+
+                      // 2 nhip nhich 2px de danh thuc OnBeginDrag cua Unity ngay tai tam khay (khong bi mat 1-2 o dau)
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(dt * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                          dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 1.5), UITouchPhaseMoved);
+                      });
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(2 * dt * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                          dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 3.0), UITouchPhaseMoved);
+                      });
+
+                      for (int step = 1; step <= moveSteps; ++step) {
+                          double delaySec = (step + 2) * dt;
+                          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(delaySec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                              double t = static_cast<double>(step) / moveSteps;
+                              double smoothT = 0.5 - 0.5 * std::cos(t * M_PI);
+                              CGPoint curPt = CGPointMake(startPt.x + (endPt.x - startPt.x) * smoothT,
+                                                          startPt.y + (endPt.y - startPt.y) * smoothT);
+                              dispatchSingleTouchPhase(targetWindow, curPt, UITouchPhaseMoved);
+                          });
+                      }
+
+                      // Giu yen ngon tay 4 nhip tai endPt de khoi trong game Lerp khop 100% vao o dich roi moi tha
+                      for (int hold = 1; hold <= 4; ++hold) {
+                          double holdDelay = (moveSteps + 2 + hold * 2) * dt;
+                          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(holdDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                              dispatchSingleTouchPhase(targetWindow, endPt, UITouchPhaseMoved);
+                          });
+                      }
+
+                      double releaseDelay = (moveSteps + 12) * dt;
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(releaseDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                          dispatchSingleTouchPhase(targetWindow, endPt, UITouchPhaseEnded);
+                          if (completion) completion();
+                      });
+                  });
+              }
+
+          private:
+              void dispatchSingleTouchPhase(UIWindow* window, CGPoint pointInWindow, UITouchPhase phase) {
+                  if (!window) return;
+                  static UITouch* activeTouch = nil;
+                  static UIView* targetHitView = nil;
+                  if (phase == UITouchPhaseBegan || activeTouch == nil) {
+                      activeTouch = [[UITouch alloc] init];
+                      targetHitView = [window hitTest:pointInWindow withEvent:nil] ?: window.rootViewController.view ?: window;
+                      if ([activeTouch respondsToSelector:@selector(setWindow:)]) [activeTouch setWindow:window];
+                      if ([activeTouch respondsToSelector:@selector(setView:)]) [activeTouch setView:targetHitView];
+                      if ([activeTouch respondsToSelector:@selector(setTapCount:)]) [activeTouch setTapCount:1];
+                      if ([activeTouch respondsToSelector:@selector(_setIsFirstTouchForView:)]) [activeTouch _setIsFirstTouchForView:YES];
+                      if ([activeTouch respondsToSelector:@selector(_setLocationInWindow:resetPrevious:)]) [activeTouch _setLocationInWindow:pointInWindow resetPrevious:YES];
+                  } else if ([activeTouch respondsToSelector:@selector(_setLocationInWindow:resetPrevious:)]) {
+                      [activeTouch _setLocationInWindow:pointInWindow resetPrevious:NO];
+                  }
+                  if ([activeTouch respondsToSelector:@selector(setPhase:)]) [activeTouch setPhase:phase];
+                  if ([activeTouch respondsToSelector:@selector(setTimestamp:)]) [activeTouch setTimestamp:[[NSProcessInfo processInfo] systemUptime]];
+
+                  UIEvent* touchesEvent = nil;
+                  if ([[UIApplication sharedApplication] respondsToSelector:NSSelectorFromString(@"_touchesEvent")])
+                      touchesEvent = [[UIApplication sharedApplication] valueForKey:@"_touchesEvent"];
+                  if (touchesEvent && [touchesEvent respondsToSelector:@selector(_addTouch:forDelayedDelivery:)]) {
+                      if ([touchesEvent respondsToSelector:@selector(_clearTouches)]) [touchesEvent _clearTouches];
+                      [touchesEvent _addTouch:activeTouch forDelayedDelivery:NO];
+                  }
+                  NSSet<UITouch*>* touchSet = [NSSet setWithObject:activeTouch];
+                  if (targetHitView) {
+                      if (phase == UITouchPhaseBegan) [targetHitView touchesBegan:touchSet withEvent:touchesEvent];
+                      else if (phase == UITouchPhaseMoved) [targetHitView touchesMoved:touchSet withEvent:touchesEvent];
+                      else if (phase == UITouchPhaseEnded) [targetHitView touchesEnded:touchSet withEvent:touchesEvent];
+                      else if (phase == UITouchPhaseCancelled) [targetHitView touchesCancelled:touchSet withEvent:touchesEvent];
+                  }
+                  if (phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled) {
+                      if (touchesEvent && [touchesEvent respondsToSelector:@selector(_clearTouches)]) [touchesEvent _clearTouches];
+                      activeTouch = nil; targetHitView = nil;
+                  }
+              }
+          };
+
+          } // namespace BBAuto
+
+          @protocol BBAutoOverlayDelegate <NSObject>
+          - (void)onOverlayAutoPlayClicked;
+          - (void)onOverlayGuideModeClicked;
+          - (void)onOverlayStopClicked;
+          - (void)onOverlayStrategyChanged:(BBAuto::PlayStrategy)newStrategy;
+          - (void)onOverlayGainChanged:(float)newGain;
+          - (void)onOverlayLiftYChanged:(float)newLiftY;
+          - (void)onOverlayBoardYChanged:(float)newBoardY;
+          - (void)onOverlayBoardWChanged:(float)newBoardW;
+          - (void)onOverlayDockYChanged:(float)newDockY;
+          - (void)onOverlayToggleCalibrationFrame:(BOOL)visible;
+          @end
+
+          @interface BBCalibrationGuideView : UIView
+          @property (nonatomic, assign) BBAuto::CalibrationConfig currentConfig;
+          @property (nonatomic, assign) BBAuto::RuntimeTelemetry currentTelemetry;
+          @property (nonatomic, assign) BBAuto::EngineRunState currentRunState;
+          @end
+
+          @implementation BBCalibrationGuideView
+          - (instancetype)initWithFrame:(CGRect)frame {
+              if (self = [super initWithFrame:frame]) { self.backgroundColor = [UIColor clearColor]; self.userInteractionEnabled = NO; }
+              return self;
+          }
+          - (void)drawRect:(CGRect)rect {
+              CGContextRef ctx = UIGraphicsGetCurrentContext();
+              CGSize sz = self.bounds.size;
+              CGFloat boardPxW = _currentConfig.boardW * sz.width;
+              CGRect boardRect = CGRectMake(_currentConfig.boardX * sz.width, _currentConfig.boardY * sz.height, boardPxW, boardPxW);
+              CGFloat cellW = boardRect.size.width / 8.0, cellH = boardRect.size.height / 8.0;
+              CGRect dockRect = CGRectMake(_currentConfig.dockX * sz.width, _currentConfig.dockY * sz.height, _currentConfig.dockW * sz.width, _currentConfig.dockH * sz.height);
+              CGFloat slotW = dockRect.size.width / 3.0;
+
+              if (_currentConfig.showCalibrationOverlay) {
+                  CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:0.1f green:0.95f blue:0.4f alpha:0.85f].CGColor);
+                  CGContextSetLineWidth(ctx, 1.8);
+                  CGContextStrokeRect(ctx, boardRect);
+                  CGContextSetLineWidth(ctx, 0.6);
+                  for (int i = 1; i < 8; ++i) {
+                      CGContextMoveToPoint(ctx, boardRect.origin.x + i * cellW, boardRect.origin.y);
+                      CGContextAddLineToPoint(ctx, boardRect.origin.x + i * cellW, CGRectGetMaxY(boardRect));
+                      CGContextMoveToPoint(ctx, boardRect.origin.x, boardRect.origin.y + i * cellH);
+                      CGContextAddLineToPoint(ctx, CGRectGetMaxX(boardRect), boardRect.origin.y + i * cellH);
+                  }
+                  CGContextStrokePath(ctx);
+                  CGContextSetFillColorWithColor(ctx, [UIColor colorWithRed:0.1f green:1.0f blue:0.3f alpha:0.9f].CGColor);
+                  for (int r = 0; r < 8; ++r)
+                      for (int c = 0; c < 8; ++c)
+                          if ((_currentTelemetry.lastDetectedBoard >> (r * 8 + c)) & 1ULL)
+                              CGContextFillEllipseInRect(ctx, CGRectMake(boardRect.origin.x + (c + 0.5) * cellW - 4.5, boardRect.origin.y + (r + 0.5) * cellH - 4.5, 9.0, 9.0));
+
+                  CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:1.0f green:0.75f blue:0.1f alpha:0.85f].CGColor);
+                  CGContextSetLineWidth(ctx, 1.8);
+                  CGContextStrokeRect(ctx, dockRect);
+                  for (int s = 0; s < 3; ++s) {
+                      if (s > 0) {
+                          CGContextMoveToPoint(ctx, dockRect.origin.x + s * slotW, dockRect.origin.y);
+                          CGContextAddLineToPoint(ctx, dockRect.origin.x + s * slotW, CGRectGetMaxY(dockRect));
+                          CGContextStrokePath(ctx);
+                      }
+                      const auto& piece = _currentTelemetry.lastDetectedDock[s];
+                      if (piece.valid) {
+                          NSString* label = [NSString stringWithFormat:@"%dx%d (%d)", piece.rows, piece.cols, piece.cellCount];
+                          [label drawAtPoint:CGPointMake(dockRect.origin.x + s * slotW + 6, dockRect.origin.y + 4)
+                              withAttributes:@{NSFontAttributeName: [UIFont boldSystemFontOfSize:11.0], NSForegroundColorAttributeName: [UIColor greenColor]}];
+                      }
+                  }
+              }
+
+              if (_currentTelemetry.hasActiveGuideMove && _currentTelemetry.currentGuideMove.valid) {
+                  const auto& mv = _currentTelemetry.currentGuideMove;
+                  int slot = mv.slotIndex;
+                  if (slot >= 0 && slot < 3) {
+                      CGRect activeSlotRect = CGRectMake(dockRect.origin.x + slot * slotW + 4, dockRect.origin.y + 4, slotW - 8, dockRect.size.height - 8);
+                      CGContextSetStrokeColorWithColor(ctx, [UIColor cyanColor].CGColor);
+                      CGContextSetLineWidth(ctx, 3.0);
+                      CGContextStrokeRect(ctx, activeSlotRect);
+                  }
+                  for (int r = 0; r < mv.piece.rows; ++r) {
+                      for (int c = 0; c < mv.piece.cols; ++c) {
+                          if (!mv.piece.getCell(r, c)) continue;
+                          int br = mv.targetRow + r, bc = mv.targetCol + c;
+                          if (br < 0 || br >= 8 || bc < 0 || bc >= 8) continue;
+                          CGRect cellRect = CGRectMake(boardRect.origin.x + bc * cellW + 2.0, boardRect.origin.y + br * cellH + 2.0, cellW - 4.0, cellH - 4.0);
+                          if (mv.linesCleared > 0) {
+                              CGContextSetFillColorWithColor(ctx, [UIColor colorWithRed:1.0f green:0.85f blue:0.1f alpha:0.58f].CGColor);
+                              CGContextSetStrokeColorWithColor(ctx, [UIColor yellowColor].CGColor);
+                          } else {
+                              CGContextSetFillColorWithColor(ctx, [UIColor colorWithRed:0.0f green:0.95f blue:1.0f alpha:0.52f].CGColor);
+                              CGContextSetStrokeColorWithColor(ctx, [UIColor cyanColor].CGColor);
+                          }
+                          UIBezierPath* rounded = [UIBezierPath bezierPathWithRoundedRect:cellRect cornerRadius:5.0];
+                          [rounded fill]; rounded.lineWidth = 2.4; [rounded stroke];
+                      }
+                  }
+                  CGFloat startX = (mv.piece.centerNormX > 0.01f) ? (mv.piece.centerNormX * sz.width) : (dockRect.origin.x + (slot + 0.5) * slotW);
+                  CGFloat startY = (mv.piece.centerNormY > 0.01f) ? (mv.piece.centerNormY * sz.height) : (dockRect.origin.y + dockRect.size.height * 0.5);
+                  CGFloat targetCenterX = boardRect.origin.x + (mv.targetCol + mv.piece.cols * 0.5) * cellW;
+                  CGFloat targetCenterY = boardRect.origin.y + (mv.targetRow + mv.piece.rows * 0.5) * cellH;
+                  CGContextSaveGState(ctx);
+                  CGContextSetStrokeColorWithColor(ctx, [UIColor yellowColor].CGColor);
+                  CGContextSetLineWidth(ctx, 2.2);
+                  CGFloat dashLengths[] = {6.0, 4.0};
+                  CGContextSetLineDash(ctx, 0, dashLengths, 2);
+                  CGContextMoveToPoint(ctx, startX, startY);
+                  CGContextAddLineToPoint(ctx, targetCenterX, targetCenterY);
+                  CGContextStrokePath(ctx);
+                  CGContextRestoreGState(ctx);
+              }
+          }
+          @end
+
+          @interface BBAutoOverlayWindow : UIWindow
+          @property (nonatomic, weak) id<BBAutoOverlayDelegate> controlDelegate;
+          - (void)updateTelemetry:(const BBAuto::RuntimeTelemetry&)telemetry runState:(BBAuto::EngineRunState)runState calibration:(const BBAuto::CalibrationConfig&)config;
+          @end
+
+          @implementation BBAutoOverlayWindow {
+              UIView *_panelView, *_dragHeaderView, *_mainControlGroup, *_configSubPanel;
+              UILabel *_titleLabel, *_statsLabel, *_statusLabel, *_gainLabel, *_liftYLabel, *_boardYLabel, *_boardWLabel, *_dockYLabel;
+              UIButton *_autoPlayBtn, *_guideModeBtn, *_stopBtn, *_calibBtn, *_configToggleBtn;
+              UISegmentedControl* _strategySegment;
+              UISlider *_gainSlider, *_liftYSlider, *_boardYSlider, *_boardWSlider, *_dockYSlider;
+              BBCalibrationGuideView* _guideView;
+              BOOL _isMinimized, _showAdvancedConfig;
+          }
+
+          - (instancetype)initWithFrame:(CGRect)frame {
+              if (self = [super initWithFrame:frame]) {
+                  self.windowLevel = UIWindowLevelStatusBar + 150.0;
+                  self.backgroundColor = [UIColor clearColor];
+                  self.rootViewController = [UIViewController new];
+                  self.rootViewController.view.backgroundColor = [UIColor clearColor];
+                  _guideView = [[BBCalibrationGuideView alloc] initWithFrame:self.bounds];
+                  _guideView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+                  [self.rootViewController.view addSubview:_guideView];
+                  [self setupControlPanel];
+              }
+              return self;
+          }
+
+          - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+              CGPoint pointInPanel = [self convertPoint:point toView:_panelView];
+              if ([_panelView pointInside:pointInPanel withEvent:event]) return [super hitTest:point withEvent:event];
+              return nil;
+          }
+
+          - (void)setupControlPanel {
+              _panelView = [[UIView alloc] initWithFrame:CGRectMake(10, 44, 276, 156)];
+              _panelView.backgroundColor = [UIColor colorWithRed:0.08f green:0.10f blue:0.16f alpha:0.94f];
+              _panelView.layer.cornerRadius = 12.0;
+              _panelView.layer.borderWidth = 1.0;
+              _panelView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
+              _panelView.clipsToBounds = YES;
+              [self.rootViewController.view addSubview:_panelView];
+
+              _dragHeaderView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 154, 26)];
+              [_panelView addSubview:_dragHeaderView];
+
+              _titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 5, 144, 18)];
+              _titleLabel.text = @"BLOCK BLAST AI";
+              _titleLabel.font = [UIFont boldSystemFontOfSize:11.0];
+              _titleLabel.textColor = [UIColor colorWithRed:0.35f green:0.85f blue:1.0f alpha:1.0f];
+              [_dragHeaderView addSubview:_titleLabel];
+
+              [_dragHeaderView addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanelPan:)]];
+              [_dragHeaderView addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleMinimize)]];
+
+              _calibBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+              _calibBtn.frame = CGRectMake(156, 3, 52, 22);
+              [_calibBtn setTitle:@"Khung" forState:UIControlStateNormal];
+              _calibBtn.titleLabel.font = [UIFont boldSystemFontOfSize:10.0];
+              [_calibBtn setTitleColor:[UIColor yellowColor] forState:UIControlStateNormal];
+              [_calibBtn addTarget:self action:@selector(handleCalibToggle) forControlEvents:UIControlEventTouchUpInside];
+              [_panelView addSubview:_calibBtn];
+
+              _configToggleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+              _configToggleBtn.frame = CGRectMake(210, 3, 60, 22);
+              [_configToggleBtn setTitle:@"Cai dat" forState:UIControlStateNormal];
+              _configToggleBtn.titleLabel.font = [UIFont boldSystemFontOfSize:10.0];
+              [_configToggleBtn setTitleColor:[UIColor colorWithRed:0.4f green:1.0f blue:0.6f alpha:1.0f] forState:UIControlStateNormal];
+              [_configToggleBtn addTarget:self action:@selector(toggleConfigPanel) forControlEvents:UIControlEventTouchUpInside];
+              [_panelView addSubview:_configToggleBtn];
+
+              _mainControlGroup = [[UIView alloc] initWithFrame:CGRectMake(0, 28, 276, 128)];
+              [_panelView addSubview:_mainControlGroup];
+
+              _autoPlayBtn = [self createActionButton:@"AUTO CHOI" frame:CGRectMake(8, 2, 86, 26) bgColor:[UIColor colorWithRed:0.15f green:0.68f blue:0.38f alpha:1.0f] action:@selector(handleAutoPlay)];
+              _guideModeBtn = [self createActionButton:@"HDAN CHOI" frame:CGRectMake(100, 2, 92, 26) bgColor:[UIColor colorWithRed:0.12f green:0.52f blue:0.88f alpha:1.0f] action:@selector(handleGuideMode)];
+              _stopBtn = [self createActionButton:@"STOP" frame:CGRectMake(198, 2, 70, 26) bgColor:[UIColor colorWithRed:0.78f green:0.22f blue:0.22f alpha:1.0f] action:@selector(handleStop)];
+              [_mainControlGroup addSubview:_autoPlayBtn];
+              [_mainControlGroup addSubview:_guideModeBtn];
+              [_mainControlGroup addSubview:_stopBtn];
+
+              _strategySegment = [[UISegmentedControl alloc] initWithItems:@[@"COMBO", @"SURVIVAL", @"AUTO"]];
+              _strategySegment.frame = CGRectMake(8, 32, 260, 24);
+              _strategySegment.selectedSegmentIndex = 2;
+              [_strategySegment addTarget:self action:@selector(handleStrategySegment:) forControlEvents:UIControlEventValueChanged];
+              [_mainControlGroup addSubview:_strategySegment];
+
+              _statsLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 60, 256, 32)];
+              _statsLabel.numberOfLines = 2;
+              _statsLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.0 weight:UIFontWeightMedium];
+              _statsLabel.textColor = [UIColor whiteColor];
+              _statsLabel.text = @"Luot: 0 | Hang xoa: 0 | Combo: 0\nPhuong an: 0 | Chien thuat: AUTO";
+              [_mainControlGroup addSubview:_statsLabel];
+
+              _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 96, 256, 18)];
+              _statusLabel.font = [UIFont systemFontOfSize:10.0];
+              _statusLabel.textColor = [UIColor colorWithRed:0.6f green:0.95f blue:0.65f alpha:1.0f];
+              _statusLabel.text = @"Trang thai: San sang";
+              [_mainControlGroup addSubview:_statusLabel];
+
+              _configSubPanel = [[UIView alloc] initWithFrame:CGRectMake(8, 28, 260, 124)];
+              _configSubPanel.hidden = YES;
+              [_panelView addSubview:_configSubPanel];
+
+              _liftYLabel = [self createConfigLabel:@"Nang Y: 112" frame:CGRectMake(0, 2, 88, 20)];
+              _liftYSlider = [self createConfigSlider:CGRectMake(92, 2, 164, 20) min:45.0f max:175.0f val:112.0f action:@selector(handleLiftYChanged:)];
+              _boardYLabel = [self createConfigLabel:@"Ban Y: 0.235" frame:CGRectMake(0, 26, 88, 20)];
+              _boardYSlider = [self createConfigSlider:CGRectMake(92, 26, 164, 20) min:0.12f max:0.35f val:0.235f action:@selector(handleBoardYChanged:)];
+              _boardWLabel = [self createConfigLabel:@"Ban W: 0.892" frame:CGRectMake(0, 50, 88, 20)];
+              _boardWSlider = [self createConfigSlider:CGRectMake(92, 50, 164, 20) min:0.75f max:0.98f val:0.892f action:@selector(handleBoardWChanged:)];
+              _dockYLabel = [self createConfigLabel:@"Dock Y: 0.686" frame:CGRectMake(0, 74, 88, 20)];
+              _dockYSlider = [self createConfigSlider:CGRectMake(92, 74, 164, 20) min:0.60f max:0.88f val:0.686f action:@selector(handleDockYChanged:)];
+              _gainLabel = [self createConfigLabel:@"Bien keo: 1.25" frame:CGRectMake(0, 98, 88, 20)];
+              _gainSlider = [self createConfigSlider:CGRectMake(92, 98, 164, 20) min:0.85f max:1.85f val:1.25f action:@selector(handleGainChanged:)];
+              for (UIView* v in @[_liftYLabel, _liftYSlider, _boardYLabel, _boardYSlider, _boardWLabel, _boardWSlider, _dockYLabel, _dockYSlider, _gainLabel, _gainSlider])
+                  [_configSubPanel addSubview:v];
+          }
+
+          - (UIButton *)createActionButton:(NSString *)title frame:(CGRect)frame bgColor:(UIColor *)bgColor action:(SEL)sel {
+              UIButton* btn = [UIButton buttonWithType:UIButtonTypeSystem];
+              btn.frame = frame; btn.backgroundColor = bgColor; btn.layer.cornerRadius = 6.0;
+              [btn setTitle:title forState:UIControlStateNormal];
+              [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+              btn.titleLabel.font = [UIFont boldSystemFontOfSize:10.5];
+              [btn addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+              return btn;
+          }
+
+          - (UILabel *)createConfigLabel:(NSString *)text frame:(CGRect)frame {
+              UILabel* lbl = [[UILabel alloc] initWithFrame:frame];
+              lbl.text = text; lbl.font = [UIFont systemFontOfSize:9.5]; lbl.textColor = [UIColor lightGrayColor];
+              return lbl;
+          }
+
+          - (UISlider *)createConfigSlider:(CGRect)frame min:(float)min max:(float)max val:(float)val action:(SEL)sel {
+              UISlider* slider = [[UISlider alloc] initWithFrame:frame];
+              slider.minimumValue = min; slider.maximumValue = max; slider.value = val;
+              [slider addTarget:self action:sel forControlEvents:UIControlEventValueChanged];
+              return slider;
+          }
+
+          - (void)handlePanelPan:(UIPanGestureRecognizer *)pan {
+              CGPoint trans = [pan translationInView:self.rootViewController.view];
+              _panelView.center = CGPointMake(_panelView.center.x + trans.x, _panelView.center.y + trans.y);
+              [pan setTranslation:CGPointZero inView:self.rootViewController.view];
+          }
+
+          - (void)toggleMinimize {
+              _isMinimized = !_isMinimized;
+              CGRect f = _panelView.frame; f.size.height = _isMinimized ? 26.0 : 156.0;
+              _mainControlGroup.hidden = _isMinimized || _showAdvancedConfig;
+              _configSubPanel.hidden = _isMinimized || !_showAdvancedConfig;
+              [UIView animateWithDuration:0.18 animations:^{
+                  self->_panelView.frame = f;
+                  self->_titleLabel.text = self->_isMinimized ? @"BLOCK BLAST [+]" : @"BLOCK BLAST AI";
+              }];
+          }
+
+          - (void)toggleConfigPanel {
+              if (_isMinimized) return;
+              _showAdvancedConfig = !_showAdvancedConfig;
+              _configSubPanel.hidden = !_showAdvancedConfig;
+              _mainControlGroup.hidden = _showAdvancedConfig;
+              [_configToggleBtn setTitle:(_showAdvancedConfig ? @"Chinh" : @"Cai dat") forState:UIControlStateNormal];
+          }
+
+          - (void)handleAutoPlay { [self.controlDelegate onOverlayAutoPlayClicked]; }
+          - (void)handleGuideMode { [self.controlDelegate onOverlayGuideModeClicked]; }
+          - (void)handleStop { [self.controlDelegate onOverlayStopClicked]; }
+          - (void)handleStrategySegment:(UISegmentedControl *)seg { [self.controlDelegate onOverlayStrategyChanged:static_cast<BBAuto::PlayStrategy>(seg.selectedSegmentIndex)]; }
+          - (void)handleGainChanged:(UISlider *)s { _gainLabel.text = [NSString stringWithFormat:@"Bien keo: %.2f", s.value]; [self.controlDelegate onOverlayGainChanged:s.value]; }
+          - (void)handleLiftYChanged:(UISlider *)s { _liftYLabel.text = [NSString stringWithFormat:@"Nang Y: %.0f", s.value]; [self.controlDelegate onOverlayLiftYChanged:s.value]; }
+          - (void)handleBoardYChanged:(UISlider *)s { _boardYLabel.text = [NSString stringWithFormat:@"Ban Y: %.3f", s.value]; [self.controlDelegate onOverlayBoardYChanged:s.value]; }
+          - (void)handleBoardWChanged:(UISlider *)s { _boardWLabel.text = [NSString stringWithFormat:@"Ban W: %.3f", s.value]; [self.controlDelegate onOverlayBoardWChanged:s.value]; }
+          - (void)handleDockYChanged:(UISlider *)s { _dockYLabel.text = [NSString stringWithFormat:@"Dock Y: %.3f", s.value]; [self.controlDelegate onOverlayDockYChanged:s.value]; }
+          - (void)handleCalibToggle { [self.controlDelegate onOverlayToggleCalibrationFrame:!_guideView.currentConfig.showCalibrationOverlay]; }
+
+          - (void)updateTelemetry:(const BBAuto::RuntimeTelemetry&)telemetry runState:(BBAuto::EngineRunState)runState calibration:(const BBAuto::CalibrationConfig&)config {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  self->_guideView.currentConfig = config;
+                  self->_guideView.currentTelemetry = telemetry;
+                  self->_guideView.currentRunState = runState;
+                  [self->_guideView setNeedsDisplay];
+                  NSString* stratStr = (telemetry.effectiveStrategy == BBAuto::PlayStrategy::MAX_SURVIVAL) ? @"MAX_SURVIVAL" : @"AUTO_COMBO";
+                  self->_statsLabel.text = [NSString stringWithFormat:@"Luot: %d | Hang xoa: %d | Combo: %d\nPhuong an: %d | Chien thuat: %@",
+                      telemetry.turnsExecuted, telemetry.totalLinesCleared, telemetry.currentCombo, telemetry.lastValidSequences, stratStr];
+                  self->_statusLabel.text = [NSString stringWithFormat:@"Trang thai: %s", telemetry.statusMessage.c_str()];
+              });
+          }
+          @end
+
+          @interface BBAutoPlayController : NSObject <BBAutoOverlayDelegate>
+          + (instancetype)sharedInstance;
+          - (void)attachToApplicationWindow;
+          @end
+
+          @implementation BBAutoPlayController {
+              BBAutoOverlayWindow* _overlayWindow;
+              dispatch_queue_t _workerQueue;
+              BBAuto::BlockSolver _solver;
+              BBAuto::VisionAnalyzer _vision;
+              BBAuto::TouchSynthesizer _touch;
+              BBAuto::CalibrationConfig _calibration;
+              BBAuto::RuntimeTelemetry _telemetry;
+              std::atomic<BBAuto::EngineRunState> _runState;
+              std::atomic<bool> _loopActive;
+              BBAuto::TurnPlan _lockedGuidePlan;
+              int _lockedGuideStepIdx, _placementConfirmCounter;
+              uint64_t _boardBeforeGuideStep;
+          }
+
+          + (instancetype)sharedInstance {
+              static BBAutoPlayController* instance = nil;
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{ instance = [[BBAutoPlayController alloc] init]; });
+              return instance;
+          }
+
+          - (instancetype)init {
+              if (self = [super init]) {
+                  _workerQueue = dispatch_queue_create("com.autoplay.blockblast.worker", DISPATCH_QUEUE_SERIAL);
+                  _runState.store(BBAuto::EngineRunState::STOPPED);
+                  _loopActive.store(false);
+              }
+              return self;
+          }
+
+          - (UIWindow *)findActiveGameWindow {
+              __block UIWindow* foundWindow = nil;
+              auto finder = ^{
+                  NSMutableArray<UIWindow*>* allWindows = [NSMutableArray array];
+                  if (@available(iOS 13.0, *)) {
+                      for (UIScene* scene in [UIApplication sharedApplication].connectedScenes)
+                          if ([scene isKindOfClass:[UIWindowScene class]])
+                              [allWindows addObjectsFromArray:((UIWindowScene*)scene).windows];
+                  }
+                  if (allWindows.count == 0) [allWindows addObjectsFromArray:[[UIApplication sharedApplication] windows]];
+                  for (UIWindow* win in allWindows) {
+                      if (win == self->_overlayWindow) continue;
+                      if (!win.hidden && win.alpha > 0.01 && CGRectGetWidth(win.bounds) > 200) { foundWindow = win; break; }
+                  }
+              };
+              if ([NSThread isMainThread]) finder();
+              else dispatch_sync(dispatch_get_main_queue(), finder);
+              return foundWindow;
+          }
+
+          - (void)attachToApplicationWindow {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  UIWindow* gameWin = [self findActiveGameWindow];
+                  if (!gameWin) return;
+                  BOOL isNew = NO;
+                  if (!self->_overlayWindow) {
+                      self->_overlayWindow = [[BBAutoOverlayWindow alloc] initWithFrame:gameWin.bounds];
+                      self->_overlayWindow.controlDelegate = self;
+                      isNew = YES;
+                  }
+                  if (@available(iOS 13.0, *)) {
+                      if (gameWin.windowScene && self->_overlayWindow.windowScene != gameWin.windowScene)
+                          self->_overlayWindow.windowScene = gameWin.windowScene;
+                  }
+                  self->_overlayWindow.hidden = NO;
+                  if (isNew) [self refreshUI];
+              });
+          }
+
+          - (void)refreshUI {
+              if (_overlayWindow) [_overlayWindow updateTelemetry:_telemetry runState:_runState.load() calibration:_calibration];
+          }
+
+          - (void)onOverlayAutoPlayClicked {
+              _lockedGuidePlan.feasible = false;
+              _runState.store(BBAuto::EngineRunState::AUTO_PLAYING);
+              _telemetry.statusMessage = "AUTO CHOI: Dang chay...";
+              [self refreshUI];
+              if (!_loopActive.exchange(true)) [self scheduleNextCycleWithDelay:0.12];
+          }
+
+          - (void)onOverlayGuideModeClicked {
+              _lockedGuidePlan.feasible = false;
+              _lockedGuideStepIdx = 0; _placementConfirmCounter = 0;
+              _runState.store(BBAuto::EngineRunState::GUIDE_PLAYING);
+              _telemetry.statusMessage = "HDAN CHOI: Mo phong khoi...";
+              [self refreshUI];
+              if (!_loopActive.exchange(true)) [self scheduleNextCycleWithDelay:0.10];
+          }
+
+          - (void)onOverlayStopClicked {
+              _runState.store(BBAuto::EngineRunState::STOPPED);
+              _loopActive.store(false);
+              _lockedGuidePlan.feasible = false;
+              _telemetry.hasActiveGuideMove = false;
+              _telemetry.statusMessage = "Da dung";
+              [self refreshUI];
+          }
+
+          - (void)onOverlayStrategyChanged:(BBAuto::PlayStrategy)newStrategy { _telemetry.requestedStrategy = newStrategy; _lockedGuidePlan.feasible = false; [self refreshUI]; }
+          - (void)onOverlayGainChanged:(float)newGain { _calibration.dragGainX = newGain; _calibration.dragGainY = newGain; _calibration.autoBiasRow = 0; _calibration.autoBiasCol = 0; }
+          - (void)onOverlayLiftYChanged:(float)newLiftY { _calibration.dragLiftOffsetY = newLiftY; _calibration.autoBiasRow = 0; }
+          - (void)onOverlayBoardYChanged:(float)newBoardY { _calibration.boardY = newBoardY; [self triggerLiveDetection]; }
+          - (void)onOverlayBoardWChanged:(float)newBoardW { _calibration.boardW = newBoardW; _calibration.boardX = (1.0f - newBoardW) * 0.5f; [self triggerLiveDetection]; }
+          - (void)onOverlayDockYChanged:(float)newDockY { _calibration.dockY = newDockY; [self triggerLiveDetection]; }
+          - (void)onOverlayToggleCalibrationFrame:(BOOL)visible { _calibration.showCalibrationOverlay = visible; [self triggerLiveDetection]; }
+
+          - (void)triggerLiveDetection {
+              dispatch_async(_workerQueue, ^{
+                  UIWindow* gameWin = [self findActiveGameWindow];
+                  if (gameWin) {
+                      BBAuto::VisionSnapshotResult snap = self->_vision.analyzeCurrentScreen(gameWin, self->_overlayWindow, self->_calibration);
+                      if (snap.success) {
+                          self->_telemetry.lastDetectedBoard = snap.boardBits;
+                          for (int i = 0; i < 3 && i < (int)snap.dockPieces.size(); ++i) self->_telemetry.lastDetectedDock[i] = snap.dockPieces[i];
+                      }
+                  }
+                  [self refreshUI];
+              });
+          }
+
+          - (void)scheduleNextCycleWithDelay:(double)delaySeconds {
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(delaySeconds * NSEC_PER_SEC)), _workerQueue, ^{ [self executeSolverCycle]; });
+          }
+
+          - (void)executeSolverCycle {
+              BBAuto::EngineRunState mode = _runState.load();
+              if (mode == BBAuto::EngineRunState::STOPPED) { _loopActive.store(false); return; }
+              UIWindow* gameWindow = [self findActiveGameWindow];
+              if (!gameWindow) { _telemetry.statusMessage = "Dang cho cua so game..."; [self refreshUI]; [self scheduleNextCycleWithDelay:0.5]; return; }
+
+              BBAuto::VisionSnapshotResult snap = _vision.analyzeCurrentScreen(gameWindow, _overlayWindow, _calibration);
+              if (!snap.success) { _telemetry.statusMessage = "Loi chup man hinh"; [self refreshUI]; [self scheduleNextCycleWithDelay:0.4]; return; }
+
+              _telemetry.lastDetectedBoard = snap.boardBits;
+              int validPiecesCount = 0;
+              for (int i = 0; i < 3 && i < (int)snap.dockPieces.size(); ++i) {
+                  _telemetry.lastDetectedDock[i] = snap.dockPieces[i];
+                  if (snap.dockPieces[i].valid) validPiecesCount++;
+              }
+
+              if (mode == BBAuto::EngineRunState::GUIDE_PLAYING) {
+                  if (_lockedGuidePlan.feasible && _lockedGuideStepIdx < (int)_lockedGuidePlan.moves.size()) {
+                      const BBAuto::PlacementMove& activeMv = _lockedGuidePlan.moves[_lockedGuideStepIdx];
+                      int slot = activeMv.slotIndex;
+                      bool slotEmptyNow = (slot >= 0 && slot < 3 && !snap.dockPieces[slot].valid);
+                      bool targetCellsFilled = ((snap.boardBits & activeMv.rawMaskOnBoard) == activeMv.rawMaskOnBoard);
+                      bool lineClearedMatch = (activeMv.linesCleared > 0 && snap.boardBits == activeMv.expectedBoardAfter);
+                      if (slotEmptyNow && (targetCellsFilled || lineClearedMatch)) {
+                          if (++_placementConfirmCounter >= 2) {
+                              _placementConfirmCounter = 0; _telemetry.movesExecuted++;
+                              if (activeMv.linesCleared > 0) { _telemetry.totalLinesCleared += activeMv.linesCleared; _telemetry.currentCombo++; _telemetry.movesSinceLastClear = 0; }
+                              else if (++_telemetry.movesSinceLastClear >= 3) _telemetry.currentCombo = 0;
+                              _lockedGuideStepIdx++; _boardBeforeGuideStep = snap.boardBits;
+                              if (_lockedGuideStepIdx < (int)_lockedGuidePlan.moves.size()) {
+                                  const auto& nextMv = _lockedGuidePlan.moves[_lockedGuideStepIdx];
+                                  _telemetry.hasActiveGuideMove = true; _telemetry.currentGuideMove = nextMv;
+                                  _telemetry.guideStepIndex = _lockedGuideStepIdx; _telemetry.guideTotalSteps = (int)_lockedGuidePlan.moves.size();
+                                  _telemetry.statusMessage = "Buoc " + std::to_string(_lockedGuideStepIdx + 1) + "/" + std::to_string(_telemetry.guideTotalSteps) + ": Keo khay " + std::to_string(nextMv.slotIndex + 1);
+                                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return;
+                              } else {
+                                  _telemetry.turnsExecuted++; _lockedGuidePlan.feasible = false; _telemetry.hasActiveGuideMove = false;
+                                  _telemetry.statusMessage = "Xong luot! Cho 3 khoi moi...";
+                                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.25]; return;
+                              }
+                          }
+                      } else if (slotEmptyNow && snap.boardBits != _boardBeforeGuideStep) {
+                          if (++_placementConfirmCounter >= 5 && validPiecesCount > 0) { _lockedGuidePlan.feasible = false; _placementConfirmCounter = 0; }
+                      } else _placementConfirmCounter = 0;
+                      if (_lockedGuidePlan.feasible) { [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return; }
+                  }
+                  if (validPiecesCount == 0) { _telemetry.hasActiveGuideMove = false; _telemetry.statusMessage = "Cho 3 khoi moi..."; [self refreshUI]; [self scheduleNextCycleWithDelay:0.25]; return; }
+                  BBAuto::TurnPlan plan = _solver.solveTurn(snap.boardBits, snap.dockPieces, _telemetry.currentCombo, _telemetry.movesSinceLastClear, _telemetry.requestedStrategy);
+                  _telemetry.effectiveStrategy = plan.activeStrategy; _telemetry.lastValidSequences = plan.validSequencesFound;
+                  if (!plan.feasible || plan.moves.empty()) { _telemetry.hasActiveGuideMove = false; _telemetry.statusMessage = "Het nuoc di!"; [self refreshUI]; [self scheduleNextCycleWithDelay:0.5]; return; }
+                  _lockedGuidePlan = plan; _lockedGuideStepIdx = 0; _boardBeforeGuideStep = snap.boardBits; _placementConfirmCounter = 0;
+                  const auto& mv0 = _lockedGuidePlan.moves[0];
+                  _telemetry.hasActiveGuideMove = true; _telemetry.currentGuideMove = mv0; _telemetry.guideStepIndex = 0; _telemetry.guideTotalSteps = (int)_lockedGuidePlan.moves.size();
+                  _telemetry.statusMessage = "Buoc 1/" + std::to_string(_telemetry.guideTotalSteps) + ": Keo khay " + std::to_string(mv0.slotIndex + 1);
+                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return;
+              }
+
+              if (validPiecesCount == 0) { _telemetry.hasActiveGuideMove = false; _telemetry.statusMessage = "Cho 3 khoi moi..."; [self refreshUI]; [self scheduleNextCycleWithDelay:0.25]; return; }
+              BBAuto::TurnPlan plan = _solver.solveTurn(snap.boardBits, snap.dockPieces, _telemetry.currentCombo, _telemetry.movesSinceLastClear, _telemetry.requestedStrategy);
+              _telemetry.effectiveStrategy = plan.activeStrategy; _telemetry.lastValidSequences = plan.validSequencesFound;
+              if (!plan.feasible || plan.moves.empty()) { _telemetry.hasActiveGuideMove = false; _telemetry.statusMessage = "Het nuoc di!"; [self refreshUI]; [self scheduleNextCycleWithDelay:0.6]; return; }
+
+              const BBAuto::PlacementMove firstMove = plan.moves.front();
+              int prevSlot = firstMove.slotIndex;
+              _telemetry.hasActiveGuideMove = true; _telemetry.currentGuideMove = firstMove; _telemetry.guideStepIndex = 0; _telemetry.guideTotalSteps = (int)plan.moves.size();
+              _telemetry.statusMessage = "Auto keo khay " + std::to_string(prevSlot + 1) + " -> (" + std::to_string(firstMove.targetRow + 1) + "," + std::to_string(firstMove.targetCol + 1) + ")";
+              [self refreshUI];
+
+              dispatch_semaphore_t dragDoneSem = dispatch_semaphore_create(0);
+              _touch.executeDragMove(gameWindow, firstMove, _calibration, ^{ dispatch_semaphore_signal(dragDoneSem); });
+              dispatch_semaphore_wait(dragDoneSem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+              [NSThread sleepForTimeInterval:(firstMove.linesCleared > 0) ? 0.38 : 0.24];
+
+              if (_runState.load() != BBAuto::EngineRunState::AUTO_PLAYING) { _loopActive.store(false); return; }
+              BBAuto::VisionSnapshotResult postSnap = _vision.analyzeCurrentScreen(gameWindow, _overlayWindow, _calibration);
+              bool slotConsumed = (prevSlot >= 0 && prevSlot < 3 && !postSnap.dockPieces[prevSlot].valid);
+              bool boardChanged = (postSnap.boardBits != snap.boardBits);
+
+              if (slotConsumed || boardChanged) {
+                  // Tu dong phat hien lech 1-2 o va bu toa do ngay lap tuc
+                  uint64_t addedBits = postSnap.boardBits & ~snap.boardBits;
+                  if (firstMove.linesCleared == 0 && BBAuto::popcount64(addedBits) == firstMove.piece.cellCount && addedBits != firstMove.rawMaskOnBoard) {
+                      int minR = 8, minC = 8;
+                      for (int r = 0; r < 8; ++r)
+                          for (int c = 0; c < 8; ++c)
+                              if ((addedBits >> (r * 8 + c)) & 1ULL) { minR = std::min(minR, r); minC = std::min(minC, c); }
+                      int errR = minR - firstMove.targetRow;
+                      int errC = minC - firstMove.targetCol;
+                      if (std::abs(errR) <= 3 && std::abs(errC) <= 3) {
+                          _calibration.autoBiasRow = std::clamp(_calibration.autoBiasRow - errR * 0.65f, -2.5f, 2.5f);
+                          _calibration.autoBiasCol = std::clamp(_calibration.autoBiasCol - errC * 0.65f, -2.5f, 2.5f);
+                      }
+                  }
+                  _telemetry.movesExecuted++;
+                  if (_telemetry.movesExecuted % 3 == 0) _telemetry.turnsExecuted++;
+                  if (firstMove.linesCleared > 0) { _telemetry.totalLinesCleared += firstMove.linesCleared; _telemetry.currentCombo++; _telemetry.movesSinceLastClear = 0; }
+                  else if (++_telemetry.movesSinceLastClear >= 3) _telemetry.currentCombo = 0;
+                  _telemetry.statusMessage = "Dat khop!";
+                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.10];
+              } else {
+                  _telemetry.statusMessage = "Chua an, chinh Nang Y / Bien keo";
+                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.25];
+              }
+          }
+          @end
+
+          __attribute__((constructor))
+          static void initializeBlockBlastAutoDylib() {
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                  [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
+                      [[BBAutoPlayController sharedInstance] attachToApplicationWindow];
+                  }];
+              });
+          }
+          EOF
+
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang++ \
+            -arch arm64 \
+            -dynamiclib \
+            -std=c++17 \
+            -fobjc-arc \
+            -O3 \
+            -mios-version-min=14.0 \
+            -isysroot "$SDK_PATH" \
+            -Wl,-install_name,@rpath/BlockBlastAuto.dylib \
+            -framework UIKit \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            BlockBlastAuto.mm \
+            -o BlockBlastAuto.dylib
+
+          ldid -S BlockBlastAuto.dylib
+          rm -f BlockBlastAuto.mm
+
+      - name: Commit BlockBlastAuto.dylib directly to Repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f BlockBlastAuto.dylib
+          git diff --staged --quiet || (git commit -m "Build BlockBlastAuto.dylib [skip ci]" && git push)
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlockBlastAuto-dylib
+          path: BlockBlastAuto.dylib
