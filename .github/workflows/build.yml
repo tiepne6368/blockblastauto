@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-ios-dylib:
     runs-on: macos-latest
@@ -19,7 +22,7 @@ jobs:
       - name: Install ldid signer
         run: brew install ldid
 
-      - name: Write and Compile BlockBlastAuto.mm
+      - name: Write and Compile Upgraded BlockBlastAuto.mm
         run: |
           cat << 'EOF' > BlockBlastAuto.mm
           #import <UIKit/UIKit.h>
@@ -69,40 +72,43 @@ jobs:
           struct TurnPlan {
               std::vector<PlacementMove> moves;
               double totalScore = -1e18;
-              int totalLinesCleared = 0, validSequencesFound = 0;
+              int totalLinesCleared = 0, validSequencesFound = 0, survivalTier = 0;
               PlayStrategy activeStrategy = PlayStrategy::AUTO_MODE;
               bool feasible = false;
           };
 
           struct CalibrationConfig {
               float boardX = 0.054f, boardY = 0.235f, boardW = 0.892f;
+              float gridBorderRatio = 0.018f;
               float dockX = 0.035f, dockY = 0.686f, dockW = 0.930f, dockH = 0.160f;
               float dockCellScale = 0.45f;
               float dragLiftOffsetY = 112.0f;
-              float dragSpeedMultiplier = 0.85f;
+              float dragSpeedMultiplier = 0.80f;
               float dragGainX = 1.25f, dragGainY = 1.25f;
-              float autoBiasRow = 0.0f, autoBiasCol = 0.0f;
+              float learnedBiasRow = 0.0f, learnedBiasCol = 0.0f;
               bool showCalibrationOverlay = false;
           };
 
           struct RuntimeTelemetry {
               int turnsExecuted = 0, movesExecuted = 0, totalLinesCleared = 0;
               int currentCombo = 0, movesSinceLastClear = 0, lastValidSequences = 0;
+              float lastBoardConfidence = 1.0f;
               uint64_t lastDetectedBoard = 0ULL;
               std::array<PieceShape, 3> lastDetectedDock;
               bool hasActiveGuideMove = false;
               PlacementMove currentGuideMove;
               int guideStepIndex = 0, guideTotalSteps = 0;
               PlayStrategy requestedStrategy = PlayStrategy::AUTO_MODE;
-              PlayStrategy effectiveStrategy = PlayStrategy::AUTO_COMBO;
+              PlayStrategy effectiveStrategy = PlayStrategy::MAX_SURVIVAL;
               std::string statusMessage = "San sang";
           };
 
           inline int popcount64(uint64_t x) { return __builtin_popcountll(x); }
 
+          // 1. BLOCK SOLVER: UU TIEN 1. SURVIVAL -> 2. FUTURE MOVES -> 3. COMBO -> 4. SCORE
           class BlockSolver {
           public:
-              BlockSolver() { initThreatMasks(); }
+              BlockSolver() { initMasks(); }
 
               static uint64_t computePlacementMask(const PieceShape& piece, int targetRow, int targetCol) {
                   uint64_t mask = 0ULL;
@@ -127,6 +133,16 @@ jobs:
                   return nextBoard & ~clearMask;
               }
 
+              bool hasAnySingleValidMove(uint64_t board, const std::vector<PieceShape>& pieces) const {
+                  for (const auto& p : pieces) {
+                      if (!p.valid || p.rows <= 0 || p.cols <= 0 || p.localMask == 0) continue;
+                      for (int r = 0; r <= 8 - p.rows; ++r)
+                          for (int c = 0; c <= 8 - p.cols; ++c)
+                              if ((board & computePlacementMask(p, r, c)) == 0ULL) return true;
+                  }
+                  return false;
+              }
+
               TurnPlan solveTurn(uint64_t currentBoard, const std::vector<PieceShape>& availablePieces,
                                  int currentCombo, int movesSinceLastClear, PlayStrategy strategyMode) {
                   TurnPlan bestPlan;
@@ -137,11 +153,11 @@ jobs:
                   int N = static_cast<int>(activePieces.size());
                   if (N == 0) return bestPlan;
 
+                  int occupiedNow = popcount64(currentBoard);
+                  int fit3x3Now = countFittingMasks(currentBoard, m_masks.square3x3);
                   PlayStrategy effectiveStrategy = strategyMode;
                   if (strategyMode == PlayStrategy::AUTO_MODE) {
-                      int occupied = popcount64(currentBoard);
-                      int currentFit3x3 = countFittingMasks(currentBoard, m_threatMasks.square3x3);
-                      effectiveStrategy = (occupied >= 38 || currentFit3x3 <= 1) ? PlayStrategy::MAX_SURVIVAL : PlayStrategy::AUTO_COMBO;
+                      effectiveStrategy = (occupiedNow >= 30 || fit3x3Now <= 2) ? PlayStrategy::MAX_SURVIVAL : PlayStrategy::AUTO_COMBO;
                   }
                   bestPlan.activeStrategy = effectiveStrategy;
 
@@ -152,16 +168,16 @@ jobs:
                       uint64_t board;
                       std::array<PlacementMove, 3> moves;
                       std::array<int, 3> clearAtStep;
-                      int totalCleared = 0;
-                      double interimScore = 0.0;
+                      int totalCleared = 0, survivalTier = 0;
+                      double score = -1e18;
                   };
 
-                  constexpr int BEAM_WIDTH = 96;
+                  constexpr int BEAM_WIDTH = 120;
                   int totalValidFullSequences = 0, maxPartialDepth = 0;
                   TurnPlan fallbackPartialPlan;
 
                   do {
-                      std::vector<SearchNode> currentBeam = {{currentBoard, {}, {0, 0, 0}, 0, 0.0}};
+                      std::vector<SearchNode> currentBeam = {{currentBoard, {}, {0, 0, 0}, 0, 0, 0.0}};
                       for (int step = 0; step < N; ++step) {
                           const PieceShape& piece = activePieces[perm[step]];
                           std::vector<SearchNode> nextBeam;
@@ -180,34 +196,40 @@ jobs:
                                       child.clearAtStep[step] = cleared;
                                       child.totalCleared = node.totalCleared + cleared;
                                       child.moves[step] = {piece.slotIndex, piece, r, c, mask, nextBoard, cleared, true};
-                                      child.interimScore = evaluateState(nextBoard, child.totalCleared, child.clearAtStep,
-                                                                         step + 1, currentCombo, movesSinceLastClear, effectiveStrategy);
+                                      child.score = evaluateState(nextBoard, child.totalCleared, child.clearAtStep,
+                                                                  step + 1, N, currentCombo, movesSinceLastClear,
+                                                                  effectiveStrategy, child.survivalTier);
                                       nextBeam.push_back(child);
                                   }
                               }
                           }
                           if (nextBeam.empty()) { currentBeam.clear(); break; }
-                          if (step + 1 > maxPartialDepth) {
-                              maxPartialDepth = step + 1;
+
+                          if (step + 1 >= maxPartialDepth) {
                               const auto& bestInterim = *std::max_element(nextBeam.begin(), nextBeam.end(),
-                                  [](const SearchNode& a, const SearchNode& b) { return a.interimScore < b.interimScore; });
-                              fallbackPartialPlan.moves.assign(bestInterim.moves.begin(), bestInterim.moves.begin() + (step + 1));
-                              fallbackPartialPlan.totalScore = bestInterim.interimScore;
-                              fallbackPartialPlan.totalLinesCleared = bestInterim.totalCleared;
-                              fallbackPartialPlan.feasible = true;
+                                  [](const SearchNode& a, const SearchNode& b) { return a.score < b.score; });
+                              if (step + 1 > maxPartialDepth || bestInterim.score > fallbackPartialPlan.totalScore) {
+                                  maxPartialDepth = step + 1;
+                                  fallbackPartialPlan.moves.assign(bestInterim.moves.begin(), bestInterim.moves.begin() + (step + 1));
+                                  fallbackPartialPlan.totalScore = bestInterim.score;
+                                  fallbackPartialPlan.totalLinesCleared = bestInterim.totalCleared;
+                                  fallbackPartialPlan.survivalTier = bestInterim.survivalTier;
+                                  fallbackPartialPlan.feasible = true;
+                              }
                           }
                           if (step < N - 1 && static_cast<int>(nextBeam.size()) > BEAM_WIDTH) {
                               std::partial_sort(nextBeam.begin(), nextBeam.begin() + BEAM_WIDTH, nextBeam.end(),
-                                  [](const SearchNode& a, const SearchNode& b) { return a.interimScore > b.interimScore; });
+                                  [](const SearchNode& a, const SearchNode& b) { return a.score > b.score; });
                               nextBeam.resize(BEAM_WIDTH);
                           }
                           currentBeam = std::move(nextBeam);
                       }
                       totalValidFullSequences += static_cast<int>(currentBeam.size());
                       for (const auto& leaf : currentBeam) {
-                          if (leaf.interimScore > bestPlan.totalScore) {
-                              bestPlan.totalScore = leaf.interimScore;
+                          if (leaf.score > bestPlan.totalScore) {
+                              bestPlan.totalScore = leaf.score;
                               bestPlan.totalLinesCleared = leaf.totalCleared;
+                              bestPlan.survivalTier = leaf.survivalTier;
                               bestPlan.moves.assign(leaf.moves.begin(), leaf.moves.begin() + N);
                               bestPlan.feasible = true;
                           }
@@ -220,36 +242,39 @@ jobs:
               }
 
           private:
-              struct PrecomputedThreatMasks {
-                  std::vector<uint64_t> square3x3, line5H, line5V, corner3x3;
-              } m_threatMasks;
+              struct PrecomputedMasks {
+                  std::vector<uint64_t> square3x3, square2x2, line5H, line5V, corner3x3;
+              } m_masks;
 
-              void initThreatMasks() {
+              void initMasks() {
                   for (int r = 0; r <= 5; ++r)
                       for (int c = 0; c <= 5; ++c) {
                           uint64_t m = 0;
                           for (int dr = 0; dr < 3; ++dr)
                               for (int dc = 0; dc < 3; ++dc) m |= (1ULL << ((r + dr) * 8 + (c + dc)));
-                          m_threatMasks.square3x3.push_back(m);
+                          m_masks.square3x3.push_back(m);
                           uint64_t topRow = (7ULL << (r * 8 + c)), botRow = (7ULL << ((r + 2) * 8 + c));
                           uint64_t leftCol = (1ULL << (r * 8 + c)) | (1ULL << ((r + 1) * 8 + c)) | (1ULL << ((r + 2) * 8 + c));
                           uint64_t rightCol = (1ULL << (r * 8 + c + 2)) | (1ULL << ((r + 1) * 8 + c + 2)) | (1ULL << ((r + 2) * 8 + c + 2));
-                          m_threatMasks.corner3x3.push_back(topRow | leftCol);
-                          m_threatMasks.corner3x3.push_back(topRow | rightCol);
-                          m_threatMasks.corner3x3.push_back(botRow | leftCol);
-                          m_threatMasks.corner3x3.push_back(botRow | rightCol);
+                          m_masks.corner3x3.push_back(topRow | leftCol);
+                          m_masks.corner3x3.push_back(topRow | rightCol);
+                          m_masks.corner3x3.push_back(botRow | leftCol);
+                          m_masks.corner3x3.push_back(botRow | rightCol);
                       }
+                  for (int r = 0; r <= 6; ++r)
+                      for (int c = 0; c <= 6; ++c)
+                          m_masks.square2x2.push_back((3ULL << (r * 8 + c)) | (3ULL << ((r + 1) * 8 + c)));
                   for (int r = 0; r < 8; ++r)
                       for (int c = 0; c <= 3; ++c) {
                           uint64_t m = 0;
                           for (int dc = 0; dc < 5; ++dc) m |= (1ULL << (r * 8 + (c + dc)));
-                          m_threatMasks.line5H.push_back(m);
+                          m_masks.line5H.push_back(m);
                       }
-                  for (int r = 0; r <= 3; ++r)
-                      for (int c = 0; c < 8; ++c) {
+                  for (int c = 0; c < 8; ++c)
+                      for (int r = 0; r <= 3; ++r) {
                           uint64_t m = 0;
                           for (int dr = 0; dr < 5; ++dr) m |= (1ULL << ((r + dr) * 8 + c));
-                          m_threatMasks.line5V.push_back(m);
+                          m_masks.line5V.push_back(m);
                       }
               }
 
@@ -294,52 +319,61 @@ jobs:
               }
 
               double evaluateState(uint64_t finalBoard, int totalLinesCleared, const std::array<int, 3>& clearAtStep,
-                                   int numSteps, int initialCombo, int initialMovesSinceClear, PlayStrategy effectiveStrategy) const {
-                  int occupiedCells = popcount64(finalBoard), emptyCells = 64 - occupiedCells;
-                  int combo = initialCombo, drought = initialMovesSinceClear, comboExtensions = 0, lastClearStepIndex = -1;
-                  bool comboBroken = false;
-                  for (int s = 0; s < numSteps; ++s) {
-                      if (clearAtStep[s] > 0) { combo++; drought = 0; comboExtensions++; lastClearStepIndex = s; }
-                      else if (++drought >= 3 && combo > 0) { combo = 0; comboBroken = true; }
-                  }
+                                   int numSteps, int totalStepsInTurn, int initialCombo, int initialMovesSinceClear,
+                                   PlayStrategy effectiveStrategy, int& outSurvivalTier) const {
+                  int emptyCells = 64 - popcount64(finalBoard);
                   int isolatedHoles = 0, smallIslands = 0, largestEmptyRegion = 0;
                   analyzeEmptyRegions(finalBoard, isolatedHoles, smallIslands, largestEmptyRegion);
+
+                  int fit3x3 = countFittingMasks(finalBoard, m_masks.square3x3);
+                  int fit2x2 = countFittingMasks(finalBoard, m_masks.square2x2);
+                  int fit5H  = countFittingMasks(finalBoard, m_masks.line5H);
+                  int fit5V  = countFittingMasks(finalBoard, m_masks.line5V);
+                  int fitL3  = countFittingMasks(finalBoard, m_masks.corner3x3);
                   int transitions = countTransitions(finalBoard);
-                  int fit3x3 = countFittingMasks(finalBoard, m_threatMasks.square3x3);
-                  int fit5H  = countFittingMasks(finalBoard, m_threatMasks.line5H);
-                  int fit5V  = countFittingMasks(finalBoard, m_threatMasks.line5V);
-                  int fitL3  = countFittingMasks(finalBoard, m_threatMasks.corner3x3);
 
-                  int primedLines = 0;
-                  for (int i = 0; i < 8; ++i) {
-                      int cntR = popcount64((finalBoard >> (i * 8)) & 0xFFULL);
-                      int cntC = popcount64(finalBoard & (0x0101010101010101ULL << i));
-                      primedLines += (cntR == 7 ? 3 : (cntR == 6 ? 1 : 0)) + (cntC == 7 ? 3 : (cntC == 6 ? 1 : 0));
+                  // TANG 1: SURVIVAL TIER
+                  int survivalTier = 1;
+                  if (fit3x3 >= 2 && (fit5H + fit5V) >= 2 && fitL3 >= 4 && emptyCells >= 26 && isolatedHoles <= 3) survivalTier = 3;
+                  else if (fit3x3 >= 1 && (fit5H + fit5V) >= 1 && fitL3 >= 2 && emptyCells >= 20 && isolatedHoles <= 5) survivalTier = 2;
+                  else if (numSteps < totalStepsInTurn && emptyCells >= 24 && (fit3x3 >= 1 || fit2x2 >= 3)) survivalTier = 2;
+                  outSurvivalTier = survivalTier;
+                  double survivalScore = survivalTier * 1000000.0;
+
+                  // TANG 2: FUTURE MOVES
+                  int totalMobility = fit3x3 * 4 + fit2x2 * 2 + (fit5H + fit5V) * 3 + fitL3;
+                  double futureScore = totalMobility * 180.0 + emptyCells * 140.0 + largestEmptyRegion * 85.0
+                                     - isolatedHoles * 920.0 - smallIslands * 580.0 - transitions * 52.0;
+                  if (fit3x3 == 0) futureScore -= 35000.0;
+                  if (fit5H == 0 && fit5V == 0) futureScore -= 22000.0;
+                  if (fitL3 == 0) futureScore -= 18000.0;
+
+                  // TANG 3: COMBO
+                  int combo = initialCombo, drought = initialMovesSinceClear, comboExt = 0, lastClearIdx = -1;
+                  bool comboBroken = false;
+                  for (int s = 0; s < numSteps; ++s) {
+                      if (clearAtStep[s] > 0) { combo++; drought = 0; comboExt++; lastClearIdx = s; }
+                      else if (++drought >= 3 && combo > 0) { combo = 0; comboBroken = true; }
                   }
+                  double comboWeight = (effectiveStrategy == PlayStrategy::AUTO_COMBO && survivalTier >= 2) ? 1.0 : 0.35;
+                  double comboScore = (comboExt > 0)
+                      ? (1600.0 * comboExt + std::min(combo, 15) * 180.0 + lastClearIdx * 350.0) * comboWeight
+                      : (comboBroken ? -1400.0 * comboWeight : 0.0);
 
-                  bool isCombo = (effectiveStrategy == PlayStrategy::AUTO_COMBO);
-                  double score = 0.0;
-                  if (comboExtensions > 0) score += (isCombo ? 2600.0 : 950.0) * comboExtensions + (combo * 320.0) + lastClearStepIndex * (isCombo ? 650.0 : 220.0);
-                  else if (comboBroken) score -= (isCombo ? 3200.0 : 900.0);
-
-                  score += totalLinesCleared * (isCombo ? 820.0 : 1150.0);
+                  // TANG 4: SCORE
+                  double rawScore = totalLinesCleared * 520.0;
                   for (int s = 0; s < numSteps; ++s)
-                      if (clearAtStep[s] >= 2) score += (clearAtStep[s] * clearAtStep[s]) * (isCombo ? 550.0 : 750.0);
+                      if (clearAtStep[s] >= 2) rawScore += (clearAtStep[s] * clearAtStep[s]) * 380.0;
 
-                  score += emptyCells * (isCombo ? 38.0 : 75.0) + largestEmptyRegion * 22.0;
-                  score -= isolatedHoles * (isCombo ? 360.0 : 580.0) + smallIslands * (isCombo ? 240.0 : 420.0) + transitions * (isCombo ? 28.0 : 45.0);
-                  score += primedLines * (isCombo ? 95.0 : 40.0);
-
-                  if (fit3x3 == 0) score -= isCombo ? 2400.0 : 4500.0; else score += std::min(fit3x3, 6) * 140.0;
-                  if (fit5H == 0 && fit5V == 0) score -= isCombo ? 1500.0 : 2800.0; else score += std::min(fit5H + fit5V, 8) * 65.0;
-                  if (fitL3 == 0) score -= 1600.0; else score += std::min(fitL3, 8) * 45.0;
-                  return score;
+                  return survivalScore + futureScore + comboScore + rawScore;
               }
           };
 
+          // 2. VISION ANALYZER: 3D BEVEL + DYNAMIC BACKGROUND CLUSTER + HOLD PREVIEW VERIFICATION
           struct VisionSnapshotResult {
               bool success = false;
               uint64_t boardBits = 0ULL;
+              float boardConfidence = 0.0f;
               std::vector<PieceShape> dockPieces;
           };
 
@@ -347,9 +381,14 @@ jobs:
           public:
               struct RGBAPixel { uint8_t r, g, b, a; };
 
-              static float computeColorDistance(const RGBAPixel& px, float bgR, float bgG, float bgB) {
-                  float dr = px.r - bgR, dg = px.g - bgG, db = px.b - bgB;
+              static float computeColorDistance(float r1, float g1, float b1, float r2, float g2, float b2) {
+                  float dr = r1 - r2, dg = g1 - g2, db = b1 - b2;
                   return std::sqrt(dr * dr + dg * dg + db * db);
+              }
+
+              static float computeSaturation(float r, float g, float b) {
+                  float mx = std::max({r, g, b}), mn = std::min({r, g, b});
+                  return (mx < 1.0f) ? 0.0f : ((mx - mn) / mx);
               }
 
               static bool captureWindowPixels(UIWindow* gameWindow, UIWindow* overlayWindowToIgnore, int targetWidth, int& outHeight, std::vector<RGBAPixel>& outPixels) {
@@ -400,15 +439,17 @@ jobs:
                       bgSamples += 2;
                   }
                   float bgR = bgSamples ? sumBgR / bgSamples : 43.0f, bgG = bgSamples ? sumBgG / bgSamples : 62.0f, bgB = bgSamples ? sumBgB / bgSamples : 129.0f;
-                  constexpr float DOCK_FG_DIST_THRESHOLD = 26.0f;
+                  constexpr float DOCK_FG_DIST_THRESHOLD = 28.0f;
                   int minFgX = x1, maxFgX = x0, minFgY = y1, maxFgY = y0, fgCount = 0;
                   for (int y = y0 + 4; y <= y1 - 4; ++y)
-                      for (int x = x0 + 4; x <= x1 - 4; ++x)
-                          if (computeColorDistance(buffer[y * bufW + x], bgR, bgG, bgB) > DOCK_FG_DIST_THRESHOLD) {
+                      for (int x = x0 + 4; x <= x1 - 4; ++x) {
+                          const RGBAPixel& px = buffer[y * bufW + x];
+                          if (computeColorDistance(px.r, px.g, px.b, bgR, bgG, bgB) > DOCK_FG_DIST_THRESHOLD) {
                               minFgX = std::min(minFgX, x); maxFgX = std::max(maxFgX, x);
                               minFgY = std::min(minFgY, y); maxFgY = std::max(maxFgY, y);
                               fgCount++;
                           }
+                      }
 
                   float fgBoxW = static_cast<float>(maxFgX - minFgX + 1), fgBoxH = static_cast<float>(maxFgY - minFgY + 1);
                   if (fgCount < 18 || fgBoxW < expectedDockCellPx * 0.50f || fgBoxH < expectedDockCellPx * 0.50f) return shape;
@@ -425,8 +466,8 @@ jobs:
                           for (int dy = -radius; dy <= radius; ++dy)
                               for (int dx = -radius; dx <= radius; ++dx) {
                                   totalSamples++;
-                                  if (computeColorDistance(buffer[std::clamp(cy + dy, y0, y1) * bufW + std::clamp(cx + dx, x0, x1)], bgR, bgG, bgB) > DOCK_FG_DIST_THRESHOLD)
-                                      activeSamples++;
+                                  const RGBAPixel& px = buffer[std::clamp(cy + dy, y0, y1) * bufW + std::clamp(cx + dx, x0, x1)];
+                                  if (computeColorDistance(px.r, px.g, px.b, bgR, bgG, bgB) > DOCK_FG_DIST_THRESHOLD) activeSamples++;
                               }
                           if (activeSamples * 10 >= totalSamples * 3) { shape.setCell(r, c, true); shape.cellCount++; }
                       }
@@ -437,41 +478,96 @@ jobs:
                   return shape;
               }
 
-              VisionSnapshotResult analyzeCurrentScreen(UIWindow* gameWindow, UIWindow* overlayWindowToIgnore, const CalibrationConfig& config) {
+              VisionSnapshotResult analyzePixels(const std::vector<RGBAPixel>& pixels, int bufW, int bufH, const CalibrationConfig& config) {
                   VisionSnapshotResult result;
-                  int bufW = 360, bufH = 0;
-                  std::vector<RGBAPixel> pixels;
-                  if (!captureWindowPixels(gameWindow, overlayWindowToIgnore, bufW, bufH, pixels)) return result;
+                  if (pixels.empty() || bufW <= 0 || bufH <= 0) return result;
 
-                  float boardPxX = config.boardX * bufW, boardPxY = config.boardY * bufH, boardPxW = config.boardW * bufW;
-                  float cellW = boardPxW / 8.0f, cellH = boardPxW / 8.0f;
-                  struct CellSample { float r, g, b, luminance; };
-                  std::array<CellSample, 64> samples;
-                  float minLum = 1000.0f, bgRefR = 26.0f, bgRefG = 35.0f, bgRefB = 74.0f;
+                  float outerX = config.boardX * bufW, outerY = config.boardY * bufH, outerW = config.boardW * bufW;
+                  float borderPad = outerW * config.gridBorderRatio;
+                  float gridX = outerX + borderPad, gridY = outerY + borderPad, gridW = outerW - 2.0f * borderPad;
+                  float cellW = gridW / 8.0f, cellH = gridW / 8.0f;
+
+                  struct CellFeatures {
+                      float r, g, b, lum, sat, innerStdDev, bevelRelief, flatnessMetric;
+                  };
+                  std::array<CellFeatures, 64> feats;
 
                   for (int r = 0; r < 8; ++r) {
                       for (int c = 0; c < 8; ++c) {
-                          int cx = static_cast<int>(std::round(boardPxX + (c + 0.5f) * cellW));
-                          int cy = static_cast<int>(std::round(boardPxY + (r + 0.5f) * cellH));
-                          float sumR = 0, sumG = 0, sumB = 0; int cnt = 0;
-                          for (int dy = -2; dy <= 2; ++dy)
-                              for (int dx = -2; dx <= 2; ++dx) {
+                          float xStart = gridX + c * cellW, yStart = gridY + r * cellH;
+                          int cx = static_cast<int>(std::round(xStart + 0.5f * cellW));
+                          int cy = static_cast<int>(std::round(yStart + 0.5f * cellH));
+
+                          float sumR = 0, sumG = 0, sumB = 0, sumLum = 0, sumLumSq = 0;
+                          int cnt = 0, coreRad = std::max(2, static_cast<int>(cellW * 0.18f));
+                          for (int dy = -coreRad; dy <= coreRad; ++dy) {
+                              for (int dx = -coreRad; dx <= coreRad; ++dx) {
                                   const RGBAPixel& p = pixels[std::clamp(cy + dy, 0, bufH - 1) * bufW + std::clamp(cx + dx, 0, bufW - 1)];
-                                  sumR += p.r; sumG += p.g; sumB += p.b; cnt++;
+                                  float l = 0.299f * p.r + 0.587f * p.g + 0.114f * p.b;
+                                  sumR += p.r; sumG += p.g; sumB += p.b;
+                                  sumLum += l; sumLumSq += l * l; cnt++;
                               }
-                          float avgR = sumR / cnt, avgG = sumG / cnt, avgB = sumB / cnt;
-                          float lum = 0.299f * avgR + 0.587f * avgG + 0.114f * avgB;
-                          samples[r * 8 + c] = {avgR, avgG, avgB, lum};
-                          if (lum < minLum && lum < 52.0f) { minLum = lum; bgRefR = avgR; bgRefG = avgG; bgRefB = avgB; }
+                          }
+                          float avgR = sumR / cnt, avgG = sumG / cnt, avgB = sumB / cnt, avgLum = sumLum / cnt;
+                          float innerStd = std::sqrt(std::max(0.0f, (sumLumSq / cnt) - (avgLum * avgLum)));
+                          float sat = computeSaturation(avgR, avgG, avgB);
+
+                          int tlX = std::clamp(static_cast<int>(std::round(xStart + 0.18f * cellW)), 0, bufW - 1);
+                          int tlY = std::clamp(static_cast<int>(std::round(yStart + 0.18f * cellH)), 0, bufH - 1);
+                          int brX = std::clamp(static_cast<int>(std::round(xStart + 0.82f * cellW)), 0, bufW - 1);
+                          int brY = std::clamp(static_cast<int>(std::round(yStart + 0.82f * cellH)), 0, bufH - 1);
+
+                          float tlLum = 0, brLum = 0; int bCnt = 0;
+                          for (int d = -2; d <= 2; ++d) {
+                              const RGBAPixel& pTL = pixels[tlY * bufW + std::clamp(tlX + d, 0, bufW - 1)];
+                              const RGBAPixel& pBR = pixels[brY * bufW + std::clamp(brX + d, 0, bufW - 1)];
+                              tlLum += 0.299f * pTL.r + 0.587f * pTL.g + 0.114f * pTL.b;
+                              brLum += 0.299f * pBR.r + 0.587f * pBR.g + 0.114f * pBR.b;
+                              bCnt++;
+                          }
+                          tlLum /= bCnt; brLum /= bCnt;
+                          float bevelRelief = std::abs(tlLum - brLum) + std::abs(tlLum - avgLum) * 0.5f;
+                          float flatness = innerStd * 1.6f + bevelRelief * 1.1f + sat * 38.0f;
+                          feats[r * 8 + c] = {avgR, avgG, avgB, avgLum, sat, innerStd, bevelRelief, flatness};
                       }
                   }
-                  if (minLum > 52.0f) minLum = 37.0f;
+
+                  std::array<CellFeatures, 64> sortedByFlatness = feats;
+                  std::sort(sortedByFlatness.begin(), sortedByFlatness.end(),
+                      [](const CellFeatures& a, const CellFeatures& b) { return a.flatnessMetric < b.flatnessMetric; });
+
+                  float bgRefR = 0, bgRefG = 0, bgRefB = 0, bgRefLum = 0, bgRefSat = 0;
+                  int clusterCount = 0;
+                  const CellFeatures& flattest = sortedByFlatness[0];
+                  for (int i = 0; i < 24; ++i) {
+                      const auto& cf = sortedByFlatness[i];
+                      if (i == 0 || (computeColorDistance(cf.r, cf.g, cf.b, flattest.r, flattest.g, flattest.b) < 22.0f && cf.bevelRelief < 18.0f)) {
+                          bgRefR += cf.r; bgRefG += cf.g; bgRefB += cf.b;
+                          bgRefLum += cf.lum; bgRefSat += cf.sat;
+                          clusterCount++;
+                      }
+                  }
+                  bgRefR /= clusterCount; bgRefG /= clusterCount; bgRefB /= clusterCount;
+                  bgRefLum /= clusterCount; bgRefSat /= clusterCount;
 
                   uint64_t boardBits = 0ULL;
+                  float confidenceSum = 0.0f;
                   for (int i = 0; i < 64; ++i) {
-                      float dr = samples[i].r - bgRefR, dg = samples[i].g - bgRefG, db = samples[i].b - bgRefB;
-                      if (std::sqrt(dr * dr + dg * dg + db * db) > 42.0f || (samples[i].luminance - minLum) > 26.0f)
+                      const auto& f = feats[i];
+                      float colorDist = computeColorDistance(f.r, f.g, f.b, bgRefR, bgRefG, bgRefB);
+                      float lumDiff = std::abs(f.lum - bgRefLum);
+                      float satDiff = std::max(0.0f, f.sat - bgRefSat);
+                      float occupancyScore = colorDist * 0.85f + lumDiff * 0.45f + f.bevelRelief * 1.25f + satDiff * 55.0f;
+                      if ((occupancyScore >= 46.0f) && (colorDist >= 26.0f || f.bevelRelief >= 14.0f || satDiff >= 0.22f))
                           boardBits |= (1ULL << i);
+                      confidenceSum += std::clamp(std::abs(occupancyScore - 46.0f) / 46.0f, 0.2f, 1.0f);
+                  }
+
+                  if (popcount64(boardBits) >= 60) {
+                      float maxColorSpread = 0.0f;
+                      for (int i = 0; i < 64; ++i)
+                          maxColorSpread = std::max(maxColorSpread, computeColorDistance(feats[i].r, feats[i].g, feats[i].b, bgRefR, bgRefG, bgRefB));
+                      if (maxColorSpread < 28.0f) boardBits = 0ULL;
                   }
 
                   float expectedDockCellPx = cellW * config.dockCellScale, slotW = config.dockW / 3.0f;
@@ -480,8 +576,66 @@ jobs:
                       result.dockPieces[s] = recognizeDockSlot(pixels, bufW, bufH, s, config.dockX + s * slotW, config.dockY, slotW, config.dockH, expectedDockCellPx);
 
                   result.boardBits = boardBits;
+                  result.boardConfidence = confidenceSum / 64.0f;
                   result.success = true;
                   return result;
+              }
+
+              VisionSnapshotResult analyzeCurrentScreen(UIWindow* gameWindow, UIWindow* overlayWindowToIgnore, const CalibrationConfig& config) {
+                  int bufW = 360, bufH = 0;
+                  std::vector<RGBAPixel> pixels;
+                  if (!captureWindowPixels(gameWindow, overlayWindowToIgnore, bufW, bufH, pixels)) return {};
+                  return analyzePixels(pixels, bufW, bufH, config);
+              }
+
+              bool detectHeldPieceOnBoard(const std::vector<RGBAPixel>& preDragPixels, const std::vector<RGBAPixel>& liveHoldPixels,
+                                          int bufW, int bufH, const CalibrationConfig& config, const PlacementMove& targetMove,
+                                          int& outDetectedRow, int& outDetectedCol, float& outConfidence) {
+                  if (preDragPixels.size() != liveHoldPixels.size() || preDragPixels.empty()) return false;
+                  float outerX = config.boardX * bufW, outerY = config.boardY * bufH, outerW = config.boardW * bufW;
+                  float borderPad = outerW * config.gridBorderRatio;
+                  float gridX = outerX + borderPad, gridY = outerY + borderPad, gridW = outerW - 2.0f * borderPad;
+                  float cellW = gridW / 8.0f, cellH = gridW / 8.0f;
+
+                  float cellDelta[8][8] = {{0}};
+                  int sampleRad = std::max(2, static_cast<int>(cellW * 0.22f));
+                  for (int r = 0; r < 8; ++r) {
+                      for (int c = 0; c < 8; ++c) {
+                          int cx = static_cast<int>(std::round(gridX + (c + 0.5f) * cellW));
+                          int cy = static_cast<int>(std::round(gridY + (r + 0.5f) * cellH));
+                          float diffSum = 0.0f; int cnt = 0;
+                          for (int dy = -sampleRad; dy <= sampleRad; ++dy)
+                              for (int dx = -sampleRad; dx <= sampleRad; ++dx) {
+                                  int idx = std::clamp(cy + dy, 0, bufH - 1) * bufW + std::clamp(cx + dx, 0, bufW - 1);
+                                  diffSum += computeColorDistance(preDragPixels[idx].r, preDragPixels[idx].g, preDragPixels[idx].b,
+                                                                  liveHoldPixels[idx].r, liveHoldPixels[idx].g, liveHoldPixels[idx].b);
+                                  cnt++;
+                              }
+                          cellDelta[r][c] = diffSum / std::max(1, cnt);
+                      }
+                  }
+
+                  int maxR = 8 - targetMove.piece.rows, maxC = 8 - targetMove.piece.cols;
+                  float bestScore = -1e9f; int bestR = -1, bestC = -1;
+                  for (int r = 0; r <= maxR; ++r) {
+                      for (int c = 0; c <= maxC; ++c) {
+                          if (std::abs(r - targetMove.targetRow) > 3 || std::abs(c - targetMove.targetCol) > 3) continue;
+                          float insideSum = 0.0f, haloPenalty = 0.0f; int insideCnt = 0, haloCnt = 0;
+                          for (int dr = -1; dr <= targetMove.piece.rows; ++dr) {
+                              for (int dc = -1; dc <= targetMove.piece.cols; ++dc) {
+                                  int br = r + dr, bc = c + dc;
+                                  if (br < 0 || br >= 8 || bc < 0 || bc >= 8) continue;
+                                  bool inMask = (dr >= 0 && dr < targetMove.piece.rows && dc >= 0 && dc < targetMove.piece.cols && targetMove.piece.getCell(dr, dc));
+                                  if (inMask) { insideSum += cellDelta[br][bc]; insideCnt++; }
+                                  else { haloPenalty += cellDelta[br][bc]; haloCnt++; }
+                              }
+                          }
+                          float score = (insideSum / std::max(1, insideCnt)) - (haloPenalty / std::max(1, haloCnt)) * 0.55f;
+                          if (score > bestScore) { bestScore = score; bestR = r; bestC = c; }
+                      }
+                  }
+                  outDetectedRow = bestR; outDetectedCol = bestC; outConfidence = bestScore;
+                  return (bestR >= 0 && bestC >= 0 && bestScore >= 18.0f);
               }
           };
 
@@ -504,75 +658,75 @@ jobs:
 
           namespace BBAuto {
 
+          // 3. TOUCH SYNTHESIZER: KEO -> GIU KIEM TRA -> VI CHINH -> THA HOAC HUY AN TOAN
           class TouchSynthesizer {
           public:
-              void executeDragMove(UIWindow* targetWindow, const PlacementMove& move, const CalibrationConfig& config, dispatch_block_t completion) {
-                  if (!targetWindow) { if (completion) completion(); return; }
+              CGPoint computeFingerHoldPoint(UIWindow* targetWindow, const PlacementMove& move, const CalibrationConfig& config, float extraOffsetRow, float extraOffsetCol) {
                   CGSize winSize = targetWindow.bounds.size;
-                  CGFloat startX = move.piece.centerNormX * winSize.width;
-                  CGFloat startY = move.piece.centerNormY * winSize.height;
+                  CGFloat startX = move.piece.centerNormX * winSize.width, startY = move.piece.centerNormY * winSize.height;
+                  CGFloat outerX = config.boardX * winSize.width, outerY = config.boardY * winSize.height, outerW = config.boardW * winSize.width;
+                  CGFloat borderPad = outerW * config.gridBorderRatio;
+                  CGFloat gridX = outerX + borderPad, gridY = outerY + borderPad, cellW = (outerW - 2.0 * borderPad) / 8.0;
 
-                  CGFloat boardX = config.boardX * winSize.width;
-                  CGFloat boardY = config.boardY * winSize.height;
-                  CGFloat cellW = (config.boardW * winSize.width) / 8.0;
+                  CGFloat targetColCenter = move.targetCol + move.piece.cols * 0.5 + config.learnedBiasCol + extraOffsetCol;
+                  CGFloat targetRowCenter = move.targetRow + move.piece.rows * 0.5 + config.learnedBiasRow + extraOffsetRow;
 
-                  CGFloat targetColWithBias = move.targetCol + move.piece.cols * 0.5 + config.autoBiasCol;
-                  CGFloat targetRowWithBias = move.targetRow + move.piece.rows * 0.5 + config.autoBiasRow;
+                  CGFloat targetPieceCenterX = gridX + targetColCenter * cellW;
+                  CGFloat targetPieceCenterY = gridY + targetRowCenter * cellW;
 
-                  CGFloat targetPieceCenterX = boardX + targetColWithBias * cellW;
-                  CGFloat targetPieceCenterY = boardY + targetRowWithBias * cellW;
-
-                  CGFloat gainX = std::max(0.75f, config.dragGainX);
-                  CGFloat gainY = std::max(0.75f, config.dragGainY);
-
+                  CGFloat gainX = std::max(0.75f, config.dragGainX), gainY = std::max(0.75f, config.dragGainY);
                   CGFloat rawEndX = startX + (targetPieceCenterX - startX) / gainX;
                   CGFloat rawEndY = startY + ((targetPieceCenterY + config.dragLiftOffsetY) - startY) / gainY;
 
-                  CGFloat endX = std::clamp<double>(rawEndX, 18.0, winSize.width - 18.0);
-                  CGFloat endY = std::clamp<double>(rawEndY, 55.0, winSize.height - 35.0);
+                  return CGPointMake(std::clamp<double>(rawEndX, 16.0, winSize.width - 16.0),
+                                     std::clamp<double>(rawEndY, 50.0, winSize.height - 30.0));
+              }
 
-                  CGPoint startPt = CGPointMake(startX, startY);
-                  CGPoint endPt   = CGPointMake(endX, endY);
+              void beginAndDragToHoldPoint(UIWindow* targetWindow, CGPoint startPt, CGPoint holdPt, float speedMult) {
+                  if (!targetWindow) return;
+                  int steps = std::clamp(static_cast<int>(std::round(22.0 / std::clamp(speedMult, 0.3f, 2.0f))), 14, 45);
+                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, startPt, UITouchPhaseBegan); });
+                  [NSThread sleepForTimeInterval:0.014];
+                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 1.8), UITouchPhaseMoved); });
+                  [NSThread sleepForTimeInterval:0.014];
+                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 3.5), UITouchPhaseMoved); });
 
-                  int moveSteps = std::clamp(static_cast<int>(std::round(26.0 / std::clamp(config.dragSpeedMultiplier, 0.3f, 2.0f))), 16, 60);
-                  double dt = 0.013;
+                  for (int s = 1; s <= steps; ++s) {
+                      [NSThread sleepForTimeInterval:0.012];
+                      double smoothT = 0.5 - 0.5 * std::cos((static_cast<double>(s) / steps) * M_PI);
+                      CGPoint curPt = CGPointMake(startPt.x + (holdPt.x - startPt.x) * smoothT, startPt.y + (holdPt.y - startPt.y) * smoothT);
+                      dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, curPt, UITouchPhaseMoved); });
+                  }
+              }
 
-                  dispatch_async(dispatch_get_main_queue(), ^{
-                      dispatchSingleTouchPhase(targetWindow, startPt, UITouchPhaseBegan);
+              void moveHeldFingerSmoothly(UIWindow* targetWindow, CGPoint fromPt, CGPoint toPt, int subSteps) {
+                  if (!targetWindow) return;
+                  for (int s = 1; s <= subSteps; ++s) {
+                      [NSThread sleepForTimeInterval:0.014];
+                      double t = static_cast<double>(s) / subSteps;
+                      CGPoint curPt = CGPointMake(fromPt.x + (toPt.x - fromPt.x) * t, fromPt.y + (toPt.y - fromPt.y) * t);
+                      dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, curPt, UITouchPhaseMoved); });
+                  }
+              }
 
-                      // 2 nhip nhich 2px de danh thuc OnBeginDrag cua Unity ngay tai tam khay (khong bi mat 1-2 o dau)
-                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(dt * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                          dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 1.5), UITouchPhaseMoved);
-                      });
-                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(2 * dt * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                          dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 3.0), UITouchPhaseMoved);
-                      });
+              void sendHoldHeartbeat(UIWindow* targetWindow, CGPoint holdPt) {
+                  if (!targetWindow) return;
+                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, holdPt, UITouchPhaseMoved); });
+              }
 
-                      for (int step = 1; step <= moveSteps; ++step) {
-                          double delaySec = (step + 2) * dt;
-                          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(delaySec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                              double t = static_cast<double>(step) / moveSteps;
-                              double smoothT = 0.5 - 0.5 * std::cos(t * M_PI);
-                              CGPoint curPt = CGPointMake(startPt.x + (endPt.x - startPt.x) * smoothT,
-                                                          startPt.y + (endPt.y - startPt.y) * smoothT);
-                              dispatchSingleTouchPhase(targetWindow, curPt, UITouchPhaseMoved);
-                          });
-                      }
-
-                      // Giu yen ngon tay 4 nhip tai endPt de khoi trong game Lerp khop 100% vao o dich roi moi tha
-                      for (int hold = 1; hold <= 4; ++hold) {
-                          double holdDelay = (moveSteps + 2 + hold * 2) * dt;
-                          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(holdDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                              dispatchSingleTouchPhase(targetWindow, endPt, UITouchPhaseMoved);
-                          });
-                      }
-
-                      double releaseDelay = (moveSteps + 12) * dt;
-                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(releaseDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                          dispatchSingleTouchPhase(targetWindow, endPt, UITouchPhaseEnded);
-                          if (completion) completion();
-                      });
+              void commitDropAtPoint(UIWindow* targetWindow, CGPoint dropPt) {
+                  if (!targetWindow) return;
+                  dispatch_sync(dispatch_get_main_queue(), ^{
+                      dispatchSingleTouchPhase(targetWindow, dropPt, UITouchPhaseMoved);
+                      dispatchSingleTouchPhase(targetWindow, dropPt, UITouchPhaseEnded);
                   });
+              }
+
+              void safeAbortDragToDock(UIWindow* targetWindow, CGPoint currentHoldPt, CGPoint dockStartPt) {
+                  if (!targetWindow) return;
+                  moveHeldFingerSmoothly(targetWindow, currentHoldPt, dockStartPt, 10);
+                  [NSThread sleepForTimeInterval:0.04];
+                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, dockStartPt, UITouchPhaseEnded); });
               }
 
           private:
@@ -644,8 +798,9 @@ jobs:
           - (void)drawRect:(CGRect)rect {
               CGContextRef ctx = UIGraphicsGetCurrentContext();
               CGSize sz = self.bounds.size;
-              CGFloat boardPxW = _currentConfig.boardW * sz.width;
-              CGRect boardRect = CGRectMake(_currentConfig.boardX * sz.width, _currentConfig.boardY * sz.height, boardPxW, boardPxW);
+              CGFloat outerW = _currentConfig.boardW * sz.width;
+              CGFloat borderPad = outerW * _currentConfig.gridBorderRatio;
+              CGRect boardRect = CGRectMake(_currentConfig.boardX * sz.width + borderPad, _currentConfig.boardY * sz.height + borderPad, outerW - 2.0 * borderPad, outerW - 2.0 * borderPad);
               CGFloat cellW = boardRect.size.width / 8.0, cellH = boardRect.size.height / 8.0;
               CGRect dockRect = CGRectMake(_currentConfig.dockX * sz.width, _currentConfig.dockY * sz.height, _currentConfig.dockW * sz.width, _currentConfig.dockH * sz.height);
               CGFloat slotW = dockRect.size.width / 3.0;
@@ -702,10 +857,10 @@ jobs:
                           if (br < 0 || br >= 8 || bc < 0 || bc >= 8) continue;
                           CGRect cellRect = CGRectMake(boardRect.origin.x + bc * cellW + 2.0, boardRect.origin.y + br * cellH + 2.0, cellW - 4.0, cellH - 4.0);
                           if (mv.linesCleared > 0) {
-                              CGContextSetFillColorWithColor(ctx, [UIColor colorWithRed:1.0f green:0.85f blue:0.1f alpha:0.58f].CGColor);
+                              CGContextSetFillColorWithColor(ctx, [UIColor colorWithRed:1.0f green:0.85f blue:0.1f alpha:0.55f].CGColor);
                               CGContextSetStrokeColorWithColor(ctx, [UIColor yellowColor].CGColor);
                           } else {
-                              CGContextSetFillColorWithColor(ctx, [UIColor colorWithRed:0.0f green:0.95f blue:1.0f alpha:0.52f].CGColor);
+                              CGContextSetFillColorWithColor(ctx, [UIColor colorWithRed:0.0f green:0.95f blue:1.0f alpha:0.50f].CGColor);
                               CGContextSetStrokeColorWithColor(ctx, [UIColor cyanColor].CGColor);
                           }
                           UIBezierPath* rounded = [UIBezierPath bezierPathWithRoundedRect:cellRect cornerRadius:5.0];
@@ -777,7 +932,7 @@ jobs:
               [_panelView addSubview:_dragHeaderView];
 
               _titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 5, 144, 18)];
-              _titleLabel.text = @"BLOCK BLAST AI";
+              _titleLabel.text = @"BLOCK BLAST AI v2";
               _titleLabel.font = [UIFont boldSystemFontOfSize:11.0];
               _titleLabel.textColor = [UIColor colorWithRed:0.35f green:0.85f blue:1.0f alpha:1.0f];
               [_dragHeaderView addSubview:_titleLabel];
@@ -821,13 +976,13 @@ jobs:
               _statsLabel.numberOfLines = 2;
               _statsLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.0 weight:UIFontWeightMedium];
               _statsLabel.textColor = [UIColor whiteColor];
-              _statsLabel.text = @"Luot: 0 | Hang xoa: 0 | Combo: 0\nPhuong an: 0 | Chien thuat: AUTO";
+              _statsLabel.text = @"Luot: 0 | Xoa: 0 | Combo: 0\nPA: 0 | Uu tien: SURVIVAL";
               [_mainControlGroup addSubview:_statsLabel];
 
               _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 96, 256, 18)];
               _statusLabel.font = [UIFont systemFontOfSize:10.0];
               _statusLabel.textColor = [UIColor colorWithRed:0.6f green:0.95f blue:0.65f alpha:1.0f];
-              _statusLabel.text = @"Trang thai: San sang";
+              _statusLabel.text = @"TT: San sang";
               [_mainControlGroup addSubview:_statusLabel];
 
               _configSubPanel = [[UIView alloc] initWithFrame:CGRectMake(8, 28, 260, 124)];
@@ -884,7 +1039,7 @@ jobs:
               _configSubPanel.hidden = _isMinimized || !_showAdvancedConfig;
               [UIView animateWithDuration:0.18 animations:^{
                   self->_panelView.frame = f;
-                  self->_titleLabel.text = self->_isMinimized ? @"BLOCK BLAST [+]" : @"BLOCK BLAST AI";
+                  self->_titleLabel.text = self->_isMinimized ? @"BLOCK BLAST [+]" : @"BLOCK BLAST AI v2";
               }];
           }
 
@@ -913,10 +1068,10 @@ jobs:
                   self->_guideView.currentTelemetry = telemetry;
                   self->_guideView.currentRunState = runState;
                   [self->_guideView setNeedsDisplay];
-                  NSString* stratStr = (telemetry.effectiveStrategy == BBAuto::PlayStrategy::MAX_SURVIVAL) ? @"MAX_SURVIVAL" : @"AUTO_COMBO";
-                  self->_statsLabel.text = [NSString stringWithFormat:@"Luot: %d | Hang xoa: %d | Combo: %d\nPhuong an: %d | Chien thuat: %@",
+                  NSString* stratStr = (telemetry.effectiveStrategy == BBAuto::PlayStrategy::MAX_SURVIVAL) ? @"SURVIVAL" : @"COMBO+SURV";
+                  self->_statsLabel.text = [NSString stringWithFormat:@"Luot: %d | Xoa: %d | Combo: %d\nPA: %d | Uu tien: %@",
                       telemetry.turnsExecuted, telemetry.totalLinesCleared, telemetry.currentCombo, telemetry.lastValidSequences, stratStr];
-                  self->_statusLabel.text = [NSString stringWithFormat:@"Trang thai: %s", telemetry.statusMessage.c_str()];
+                  self->_statusLabel.text = [NSString stringWithFormat:@"TT: %s", telemetry.statusMessage.c_str()];
               });
           }
           @end
@@ -1003,7 +1158,7 @@ jobs:
           - (void)onOverlayAutoPlayClicked {
               _lockedGuidePlan.feasible = false;
               _runState.store(BBAuto::EngineRunState::AUTO_PLAYING);
-              _telemetry.statusMessage = "AUTO CHOI: Dang chay...";
+              _telemetry.statusMessage = "AUTO: Nhan dien & kiem chung...";
               [self refreshUI];
               if (!_loopActive.exchange(true)) [self scheduleNextCycleWithDelay:0.12];
           }
@@ -1012,7 +1167,7 @@ jobs:
               _lockedGuidePlan.feasible = false;
               _lockedGuideStepIdx = 0; _placementConfirmCounter = 0;
               _runState.store(BBAuto::EngineRunState::GUIDE_PLAYING);
-              _telemetry.statusMessage = "HDAN CHOI: Mo phong khoi...";
+              _telemetry.statusMessage = "HDAN CHOI: Mo phong chinh xac...";
               [self refreshUI];
               if (!_loopActive.exchange(true)) [self scheduleNextCycleWithDelay:0.10];
           }
@@ -1027,8 +1182,8 @@ jobs:
           }
 
           - (void)onOverlayStrategyChanged:(BBAuto::PlayStrategy)newStrategy { _telemetry.requestedStrategy = newStrategy; _lockedGuidePlan.feasible = false; [self refreshUI]; }
-          - (void)onOverlayGainChanged:(float)newGain { _calibration.dragGainX = newGain; _calibration.dragGainY = newGain; _calibration.autoBiasRow = 0; _calibration.autoBiasCol = 0; }
-          - (void)onOverlayLiftYChanged:(float)newLiftY { _calibration.dragLiftOffsetY = newLiftY; _calibration.autoBiasRow = 0; }
+          - (void)onOverlayGainChanged:(float)newGain { _calibration.dragGainX = newGain; _calibration.dragGainY = newGain; _calibration.learnedBiasRow = 0; _calibration.learnedBiasCol = 0; }
+          - (void)onOverlayLiftYChanged:(float)newLiftY { _calibration.dragLiftOffsetY = newLiftY; _calibration.learnedBiasRow = 0; }
           - (void)onOverlayBoardYChanged:(float)newBoardY { _calibration.boardY = newBoardY; [self triggerLiveDetection]; }
           - (void)onOverlayBoardWChanged:(float)newBoardW { _calibration.boardW = newBoardW; _calibration.boardX = (1.0f - newBoardW) * 0.5f; [self triggerLiveDetection]; }
           - (void)onOverlayDockYChanged:(float)newDockY { _calibration.dockY = newDockY; [self triggerLiveDetection]; }
@@ -1048,6 +1203,99 @@ jobs:
               });
           }
 
+          - (BBAuto::VisionSnapshotResult)captureVerifiedSnapshot:(UIWindow *)gameWindow outRawPixels:(std::vector<BBAuto::VisionAnalyzer::RGBAPixel> &)outPixels outW:(int &)outW outH:(int &)outH {
+              outW = 360; outH = 0;
+              BBAuto::VisionSnapshotResult snap1, snap2;
+              if (!BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, outW, outH, outPixels)) return snap1;
+              snap1 = _vision.analyzePixels(outPixels, outW, outH, _calibration);
+
+              if (snap1.boardConfidence < 0.45f || BBAuto::popcount64(snap1.boardBits) >= 54 || !_solver.hasAnySingleValidMove(snap1.boardBits, snap1.dockPieces)) {
+                  [NSThread sleepForTimeInterval:0.12];
+                  std::vector<BBAuto::VisionAnalyzer::RGBAPixel> pixels2;
+                  int h2 = 0;
+                  if (BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, outW, h2, pixels2)) {
+                      snap2 = _vision.analyzePixels(pixels2, outW, h2, _calibration);
+                      if (snap2.success) {
+                          snap1.boardBits &= snap2.boardBits;
+                          outPixels = std::move(pixels2);
+                          outH = h2;
+                      }
+                  }
+              }
+              return snap1;
+          }
+
+          - (bool)executeDragVerifyConfirmDrop:(UIWindow *)gameWindow
+                                          move:(const BBAuto::PlacementMove &)move
+                                 preDragPixels:(const std::vector<BBAuto::VisionAnalyzer::RGBAPixel> &)preDragPixels
+                                          bufW:(int)bufW
+                                          bufH:(int)bufH {
+              CGSize winSize = gameWindow.bounds.size;
+              CGPoint startPt = CGPointMake(move.piece.centerNormX * winSize.width, move.piece.centerNormY * winSize.height);
+              float corrRow = 0.0f, corrCol = 0.0f;
+              CGPoint holdPt = _touch.computeFingerHoldPoint(gameWindow, move, _calibration, corrRow, corrCol);
+
+              _telemetry.statusMessage = "1. Keo & Giu (" + std::to_string(move.targetRow + 1) + "," + std::to_string(move.targetCol + 1) + ")...";
+              [self refreshUI];
+
+              _touch.beginAndDragToHoldPoint(gameWindow, startPt, holdPt, _calibration.dragSpeedMultiplier);
+
+              int verifiedCount = 0;
+              bool positionConfirmed = false;
+
+              for (int attempt = 0; attempt < 4; ++attempt) {
+                  if (_runState.load() != BBAuto::EngineRunState::AUTO_PLAYING) {
+                      _touch.safeAbortDragToDock(gameWindow, holdPt, startPt);
+                      return false;
+                  }
+                  _touch.sendHoldHeartbeat(gameWindow, holdPt);
+                  [NSThread sleepForTimeInterval:0.18];
+                  _touch.sendHoldHeartbeat(gameWindow, holdPt);
+
+                  std::vector<BBAuto::VisionAnalyzer::RGBAPixel> liveHoldPixels;
+                  int liveH = 0;
+                  if (BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, bufW, liveH, liveHoldPixels) && liveH == bufH) {
+                      int detRow = -1, detCol = -1; float conf = 0.0f;
+                      bool found = _vision.detectHeldPieceOnBoard(preDragPixels, liveHoldPixels, bufW, bufH, _calibration, move, detRow, detCol, conf);
+                      if (found) {
+                          int errRow = detRow - move.targetRow, errCol = detCol - move.targetCol;
+                          if (errRow == 0 && errCol == 0) {
+                              verifiedCount++;
+                              _telemetry.statusMessage = "2. Kiem tra KHOP (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") [" + std::to_string(verifiedCount) + "/2]";
+                              [self refreshUI];
+                              if (verifiedCount >= 2) { positionConfirmed = true; break; }
+                          } else if (std::abs(errRow) <= 3 && std::abs(errCol) <= 3) {
+                              verifiedCount = 0;
+                              corrRow -= errRow * 0.85f;
+                              corrCol -= errCol * 0.85f;
+                              CGPoint newHoldPt = _touch.computeFingerHoldPoint(gameWindow, move, _calibration, corrRow, corrCol);
+                              _telemetry.statusMessage = "2. Lech (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") -> Chinh...";
+                              [self refreshUI];
+                              _touch.moveHeldFingerSmoothly(gameWindow, holdPt, newHoldPt, 6);
+                              holdPt = newHoldPt;
+                          }
+                      } else {
+                          verifiedCount++;
+                          if (verifiedCount >= 2) { positionConfirmed = true; break; }
+                      }
+                  }
+              }
+
+              if (positionConfirmed) {
+                  _telemetry.statusMessage = "3. XAC NHAN KHOP -> THA KHOI!";
+                  [self refreshUI];
+                  _touch.commitDropAtPoint(gameWindow, holdPt);
+                  _calibration.learnedBiasRow = std::clamp(_calibration.learnedBiasRow + corrRow * 0.35f, -2.0f, 2.0f);
+                  _calibration.learnedBiasCol = std::clamp(_calibration.learnedBiasCol + corrCol * 0.35f, -2.0f, 2.0f);
+                  return true;
+              } else {
+                  _telemetry.statusMessage = "3. Khong khop -> HUY KEO an toan!";
+                  [self refreshUI];
+                  _touch.safeAbortDragToDock(gameWindow, holdPt, startPt);
+                  return false;
+              }
+          }
+
           - (void)scheduleNextCycleWithDelay:(double)delaySeconds {
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(delaySeconds * NSEC_PER_SEC)), _workerQueue, ^{ [self executeSolverCycle]; });
           }
@@ -1056,16 +1304,27 @@ jobs:
               BBAuto::EngineRunState mode = _runState.load();
               if (mode == BBAuto::EngineRunState::STOPPED) { _loopActive.store(false); return; }
               UIWindow* gameWindow = [self findActiveGameWindow];
-              if (!gameWindow) { _telemetry.statusMessage = "Dang cho cua so game..."; [self refreshUI]; [self scheduleNextCycleWithDelay:0.5]; return; }
+              if (!gameWindow) { _telemetry.statusMessage = "Cho cua so game..."; [self refreshUI]; [self scheduleNextCycleWithDelay:0.5]; return; }
 
-              BBAuto::VisionSnapshotResult snap = _vision.analyzeCurrentScreen(gameWindow, _overlayWindow, _calibration);
+              std::vector<BBAuto::VisionAnalyzer::RGBAPixel> preDragPixels;
+              int bufW = 360, bufH = 0;
+              BBAuto::VisionSnapshotResult snap = [self captureVerifiedSnapshot:gameWindow outRawPixels:preDragPixels outW:bufW outH:bufH];
               if (!snap.success) { _telemetry.statusMessage = "Loi chup man hinh"; [self refreshUI]; [self scheduleNextCycleWithDelay:0.4]; return; }
 
               _telemetry.lastDetectedBoard = snap.boardBits;
+              _telemetry.lastBoardConfidence = snap.boardConfidence;
               int validPiecesCount = 0;
               for (int i = 0; i < 3 && i < (int)snap.dockPieces.size(); ++i) {
                   _telemetry.lastDetectedDock[i] = snap.dockPieces[i];
                   if (snap.dockPieces[i].valid) validPiecesCount++;
+              }
+
+              if (validPiecesCount == 0) {
+                  _telemetry.hasActiveGuideMove = false;
+                  _telemetry.statusMessage = "Cho game phat 3 khoi moi...";
+                  [self refreshUI];
+                  [self scheduleNextCycleWithDelay:0.25];
+                  return;
               }
 
               if (mode == BBAuto::EngineRunState::GUIDE_PLAYING) {
@@ -1075,6 +1334,7 @@ jobs:
                       bool slotEmptyNow = (slot >= 0 && slot < 3 && !snap.dockPieces[slot].valid);
                       bool targetCellsFilled = ((snap.boardBits & activeMv.rawMaskOnBoard) == activeMv.rawMaskOnBoard);
                       bool lineClearedMatch = (activeMv.linesCleared > 0 && snap.boardBits == activeMv.expectedBoardAfter);
+
                       if (slotEmptyNow && (targetCellsFilled || lineClearedMatch)) {
                           if (++_placementConfirmCounter >= 2) {
                               _placementConfirmCounter = 0; _telemetry.movesExecuted++;
@@ -1094,14 +1354,18 @@ jobs:
                               }
                           }
                       } else if (slotEmptyNow && snap.boardBits != _boardBeforeGuideStep) {
-                          if (++_placementConfirmCounter >= 5 && validPiecesCount > 0) { _lockedGuidePlan.feasible = false; _placementConfirmCounter = 0; }
+                          _lockedGuidePlan.feasible = false; _placementConfirmCounter = 0;
                       } else _placementConfirmCounter = 0;
                       if (_lockedGuidePlan.feasible) { [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return; }
                   }
-                  if (validPiecesCount == 0) { _telemetry.hasActiveGuideMove = false; _telemetry.statusMessage = "Cho 3 khoi moi..."; [self refreshUI]; [self scheduleNextCycleWithDelay:0.25]; return; }
+
                   BBAuto::TurnPlan plan = _solver.solveTurn(snap.boardBits, snap.dockPieces, _telemetry.currentCombo, _telemetry.movesSinceLastClear, _telemetry.requestedStrategy);
                   _telemetry.effectiveStrategy = plan.activeStrategy; _telemetry.lastValidSequences = plan.validSequencesFound;
-                  if (!plan.feasible || plan.moves.empty()) { _telemetry.hasActiveGuideMove = false; _telemetry.statusMessage = "Het nuoc di!"; [self refreshUI]; [self scheduleNextCycleWithDelay:0.5]; return; }
+                  if (!plan.feasible || plan.moves.empty()) {
+                      _telemetry.hasActiveGuideMove = false;
+                      _telemetry.statusMessage = "Dang kiem tra lai ban co...";
+                      [self refreshUI]; [self scheduleNextCycleWithDelay:0.35]; return;
+                  }
                   _lockedGuidePlan = plan; _lockedGuideStepIdx = 0; _boardBeforeGuideStep = snap.boardBits; _placementConfirmCounter = 0;
                   const auto& mv0 = _lockedGuidePlan.moves[0];
                   _telemetry.hasActiveGuideMove = true; _telemetry.currentGuideMove = mv0; _telemetry.guideStepIndex = 0; _telemetry.guideTotalSteps = (int)_lockedGuidePlan.moves.size();
@@ -1109,51 +1373,67 @@ jobs:
                   [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return;
               }
 
-              if (validPiecesCount == 0) { _telemetry.hasActiveGuideMove = false; _telemetry.statusMessage = "Cho 3 khoi moi..."; [self refreshUI]; [self scheduleNextCycleWithDelay:0.25]; return; }
+              // CHE DO AUTO CHOI: TINH TOAN -> MO PHONG -> KEO GIU KIEM TRA 1S -> XAC NHAN -> THA -> DOI CHIEU SAU KHI THA
               BBAuto::TurnPlan plan = _solver.solveTurn(snap.boardBits, snap.dockPieces, _telemetry.currentCombo, _telemetry.movesSinceLastClear, _telemetry.requestedStrategy);
-              _telemetry.effectiveStrategy = plan.activeStrategy; _telemetry.lastValidSequences = plan.validSequencesFound;
-              if (!plan.feasible || plan.moves.empty()) { _telemetry.hasActiveGuideMove = false; _telemetry.statusMessage = "Het nuoc di!"; [self refreshUI]; [self scheduleNextCycleWithDelay:0.6]; return; }
+              _telemetry.effectiveStrategy = plan.activeStrategy;
+              _telemetry.lastValidSequences = plan.validSequencesFound;
+
+              if (!plan.feasible || plan.moves.empty()) {
+                  _telemetry.hasActiveGuideMove = false;
+                  _telemetry.statusMessage = "Kiem tra lai ban co (tranh bao sai)...";
+                  [self refreshUI];
+                  [self scheduleNextCycleWithDelay:0.45];
+                  return;
+              }
 
               const BBAuto::PlacementMove firstMove = plan.moves.front();
               int prevSlot = firstMove.slotIndex;
-              _telemetry.hasActiveGuideMove = true; _telemetry.currentGuideMove = firstMove; _telemetry.guideStepIndex = 0; _telemetry.guideTotalSteps = (int)plan.moves.size();
-              _telemetry.statusMessage = "Auto keo khay " + std::to_string(prevSlot + 1) + " -> (" + std::to_string(firstMove.targetRow + 1) + "," + std::to_string(firstMove.targetCol + 1) + ")";
+              _telemetry.hasActiveGuideMove = true;
+              _telemetry.currentGuideMove = firstMove;
+              _telemetry.guideStepIndex = 0;
+              _telemetry.guideTotalSteps = (int)plan.moves.size();
               [self refreshUI];
 
-              dispatch_semaphore_t dragDoneSem = dispatch_semaphore_create(0);
-              _touch.executeDragMove(gameWindow, firstMove, _calibration, ^{ dispatch_semaphore_signal(dragDoneSem); });
-              dispatch_semaphore_wait(dragDoneSem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-              [NSThread sleepForTimeInterval:(firstMove.linesCleared > 0) ? 0.38 : 0.24];
+              bool dropped = [self executeDragVerifyConfirmDrop:gameWindow move:firstMove preDragPixels:preDragPixels bufW:bufW bufH:bufH];
+              if (!dropped) {
+                  [self scheduleNextCycleWithDelay:0.30];
+                  return;
+              }
 
+              [NSThread sleepForTimeInterval:(firstMove.linesCleared > 0) ? 0.42 : 0.25];
               if (_runState.load() != BBAuto::EngineRunState::AUTO_PLAYING) { _loopActive.store(false); return; }
+
+              // Doi chieu trang thai ban co sau khi tha voi expectedBoardAfter
               BBAuto::VisionSnapshotResult postSnap = _vision.analyzeCurrentScreen(gameWindow, _overlayWindow, _calibration);
               bool slotConsumed = (prevSlot >= 0 && prevSlot < 3 && !postSnap.dockPieces[prevSlot].valid);
-              bool boardChanged = (postSnap.boardBits != snap.boardBits);
+              bool exactMatch = (postSnap.boardBits == firstMove.expectedBoardAfter);
 
-              if (slotConsumed || boardChanged) {
-                  // Tu dong phat hien lech 1-2 o va bu toa do ngay lap tuc
-                  uint64_t addedBits = postSnap.boardBits & ~snap.boardBits;
-                  if (firstMove.linesCleared == 0 && BBAuto::popcount64(addedBits) == firstMove.piece.cellCount && addedBits != firstMove.rawMaskOnBoard) {
-                      int minR = 8, minC = 8;
-                      for (int r = 0; r < 8; ++r)
-                          for (int c = 0; c < 8; ++c)
-                              if ((addedBits >> (r * 8 + c)) & 1ULL) { minR = std::min(minR, r); minC = std::min(minC, c); }
-                      int errR = minR - firstMove.targetRow;
-                      int errC = minC - firstMove.targetCol;
-                      if (std::abs(errR) <= 3 && std::abs(errC) <= 3) {
-                          _calibration.autoBiasRow = std::clamp(_calibration.autoBiasRow - errR * 0.65f, -2.5f, 2.5f);
-                          _calibration.autoBiasCol = std::clamp(_calibration.autoBiasCol - errC * 0.65f, -2.5f, 2.5f);
+              if (slotConsumed || postSnap.boardBits != snap.boardBits) {
+                  if (!exactMatch && firstMove.linesCleared == 0) {
+                      uint64_t addedBits = postSnap.boardBits & ~snap.boardBits;
+                      if (BBAuto::popcount64(addedBits) == firstMove.piece.cellCount) {
+                          int minR = 8, minC = 8;
+                          for (int r = 0; r < 8; ++r)
+                              for (int c = 0; c < 8; ++c)
+                                  if ((addedBits >> (r * 8 + c)) & 1ULL) { minR = std::min(minR, r); minC = std::min(minC, c); }
+                          int errR = minR - firstMove.targetRow, errC = minC - firstMove.targetCol;
+                          if (std::abs(errR) <= 2 && std::abs(errC) <= 2) {
+                              _calibration.learnedBiasRow = std::clamp(_calibration.learnedBiasRow - errR * 0.6f, -2.0f, 2.0f);
+                              _calibration.learnedBiasCol = std::clamp(_calibration.learnedBiasCol - errC * 0.6f, -2.0f, 2.0f);
+                          }
                       }
                   }
                   _telemetry.movesExecuted++;
                   if (_telemetry.movesExecuted % 3 == 0) _telemetry.turnsExecuted++;
                   if (firstMove.linesCleared > 0) { _telemetry.totalLinesCleared += firstMove.linesCleared; _telemetry.currentCombo++; _telemetry.movesSinceLastClear = 0; }
                   else if (++_telemetry.movesSinceLastClear >= 3) _telemetry.currentCombo = 0;
-                  _telemetry.statusMessage = "Dat khop!";
-                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.10];
+                  _telemetry.statusMessage = exactMatch ? "4. Dong bo ban co KHOP 100%!" : "4. Da cap nhat ban co moi!";
+                  [self refreshUI];
+                  [self scheduleNextCycleWithDelay:0.12];
               } else {
-                  _telemetry.statusMessage = "Chua an, chinh Nang Y / Bien keo";
-                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.25];
+                  _telemetry.statusMessage = "Chua an khoi -> Quet lai ban co";
+                  [self refreshUI];
+                  [self scheduleNextCycleWithDelay:0.25];
               }
           }
           @end
