@@ -49,6 +49,8 @@ jobs:
               uint32_t localMask = 0;
               bool valid = false;
               float centerNormX = 0.0f, centerNormY = 0.0f;
+              float colorR = 220.0f, colorG = 220.0f, colorB = 220.0f;
+
               bool getCell(int r, int c) const {
                   if (r < 0 || r >= rows || c < 0 || c >= cols) return false;
                   return (localMask >> (r * 5 + c)) & 1U;
@@ -84,7 +86,7 @@ jobs:
               float dockCellScale = 0.45f;
               float dragLiftOffsetY = 112.0f;
               float dragSpeedMultiplier = 0.80f;
-              float dragGainX = 1.25f, dragGainY = 1.25f;
+              float dragGainX = 1.65f, dragGainY = 1.65f;
               float learnedBiasRow = 0.0f, learnedBiasCol = 0.0f;
               bool showCalibrationOverlay = false;
           };
@@ -98,6 +100,8 @@ jobs:
               bool hasActiveGuideMove = false;
               PlacementMove currentGuideMove;
               int guideStepIndex = 0, guideTotalSteps = 0;
+              bool isSteeringHold = false;
+              int liveHeldRow = -1, liveHeldCol = -1;
               PlayStrategy requestedStrategy = PlayStrategy::AUTO_MODE;
               PlayStrategy effectiveStrategy = PlayStrategy::MAX_SURVIVAL;
               std::string statusMessage = "San sang";
@@ -332,7 +336,6 @@ jobs:
                   int fitL3  = countFittingMasks(finalBoard, m_masks.corner3x3);
                   int transitions = countTransitions(finalBoard);
 
-                  // TANG 1: SURVIVAL TIER
                   int survivalTier = 1;
                   if (fit3x3 >= 2 && (fit5H + fit5V) >= 2 && fitL3 >= 4 && emptyCells >= 26 && isolatedHoles <= 3) survivalTier = 3;
                   else if (fit3x3 >= 1 && (fit5H + fit5V) >= 1 && fitL3 >= 2 && emptyCells >= 20 && isolatedHoles <= 5) survivalTier = 2;
@@ -340,7 +343,6 @@ jobs:
                   outSurvivalTier = survivalTier;
                   double survivalScore = survivalTier * 1000000.0;
 
-                  // TANG 2: FUTURE MOVES
                   int totalMobility = fit3x3 * 4 + fit2x2 * 2 + (fit5H + fit5V) * 3 + fitL3;
                   double futureScore = totalMobility * 180.0 + emptyCells * 140.0 + largestEmptyRegion * 85.0
                                      - isolatedHoles * 920.0 - smallIslands * 580.0 - transitions * 52.0;
@@ -348,7 +350,6 @@ jobs:
                   if (fit5H == 0 && fit5V == 0) futureScore -= 22000.0;
                   if (fitL3 == 0) futureScore -= 18000.0;
 
-                  // TANG 3: COMBO
                   int combo = initialCombo, drought = initialMovesSinceClear, comboExt = 0, lastClearIdx = -1;
                   bool comboBroken = false;
                   for (int s = 0; s < numSteps; ++s) {
@@ -360,7 +361,6 @@ jobs:
                       ? (1600.0 * comboExt + std::min(combo, 15) * 180.0 + lastClearIdx * 350.0) * comboWeight
                       : (comboBroken ? -1400.0 * comboWeight : 0.0);
 
-                  // TANG 4: SCORE
                   double rawScore = totalLinesCleared * 520.0;
                   for (int s = 0; s < numSteps; ++s)
                       if (clearAtStep[s] >= 2) rawScore += (clearAtStep[s] * clearAtStep[s]) * 380.0;
@@ -369,7 +369,7 @@ jobs:
               }
           };
 
-          // 2. VISION ANALYZER: 3D BEVEL + DYNAMIC BACKGROUND CLUSTER + HOLD PREVIEW VERIFICATION
+          // 2. VISION ANALYZER: NHAN DIEN NEN XAM + TIM DUONG KHOI XEP CHO TRONG 3 GIAY
           struct VisionSnapshotResult {
               bool success = false;
               uint64_t boardBits = 0ULL;
@@ -441,12 +441,15 @@ jobs:
                   float bgR = bgSamples ? sumBgR / bgSamples : 43.0f, bgG = bgSamples ? sumBgG / bgSamples : 62.0f, bgB = bgSamples ? sumBgB / bgSamples : 129.0f;
                   constexpr float DOCK_FG_DIST_THRESHOLD = 28.0f;
                   int minFgX = x1, maxFgX = x0, minFgY = y1, maxFgY = y0, fgCount = 0;
+                  float sumFgR = 0, sumFgG = 0, sumFgB = 0;
+
                   for (int y = y0 + 4; y <= y1 - 4; ++y)
                       for (int x = x0 + 4; x <= x1 - 4; ++x) {
                           const RGBAPixel& px = buffer[y * bufW + x];
                           if (computeColorDistance(px.r, px.g, px.b, bgR, bgG, bgB) > DOCK_FG_DIST_THRESHOLD) {
                               minFgX = std::min(minFgX, x); maxFgX = std::max(maxFgX, x);
                               minFgY = std::min(minFgY, y); maxFgY = std::max(maxFgY, y);
+                              sumFgR += px.r; sumFgG += px.g; sumFgB += px.b;
                               fgCount++;
                           }
                       }
@@ -454,6 +457,9 @@ jobs:
                   float fgBoxW = static_cast<float>(maxFgX - minFgX + 1), fgBoxH = static_cast<float>(maxFgY - minFgY + 1);
                   if (fgCount < 18 || fgBoxW < expectedDockCellPx * 0.50f || fgBoxH < expectedDockCellPx * 0.50f) return shape;
 
+                  shape.colorR = sumFgR / fgCount;
+                  shape.colorG = sumFgG / fgCount;
+                  shape.colorB = sumFgB / fgCount;
                   shape.cols = std::clamp(static_cast<int>(std::round(fgBoxW / expectedDockCellPx)), 1, 5);
                   shape.rows = std::clamp(static_cast<int>(std::round(fgBoxH / expectedDockCellPx)), 1, 5);
                   float cellStepW = fgBoxW / shape.cols, cellStepH = fgBoxH / shape.rows;
@@ -588,54 +594,63 @@ jobs:
                   return analyzePixels(pixels, bufW, bufH, config);
               }
 
+              // Quet toan bo ban co 8x8 de tim vi tri thuc te cua khoi xep cho dang duoc keo tren man hinh
               bool detectHeldPieceOnBoard(const std::vector<RGBAPixel>& preDragPixels, const std::vector<RGBAPixel>& liveHoldPixels,
-                                          int bufW, int bufH, const CalibrationConfig& config, const PlacementMove& targetMove,
-                                          int& outDetectedRow, int& outDetectedCol, float& outConfidence) {
+                                          int bufW, int bufH, uint64_t preBoardBits, const CalibrationConfig& config,
+                                          const PlacementMove& targetMove, int& outDetectedRow, int& outDetectedCol) {
                   if (preDragPixels.size() != liveHoldPixels.size() || preDragPixels.empty()) return false;
                   float outerX = config.boardX * bufW, outerY = config.boardY * bufH, outerW = config.boardW * bufW;
                   float borderPad = outerW * config.gridBorderRatio;
                   float gridX = outerX + borderPad, gridY = outerY + borderPad, gridW = outerW - 2.0f * borderPad;
                   float cellW = gridW / 8.0f, cellH = gridW / 8.0f;
 
-                  float cellDelta[8][8] = {{0}};
-                  int sampleRad = std::max(2, static_cast<int>(cellW * 0.22f));
+                  float cellActivity[8][8] = {{0}};
+                  int sampleRad = std::max(2, static_cast<int>(cellW * 0.24f));
+
                   for (int r = 0; r < 8; ++r) {
                       for (int c = 0; c < 8; ++c) {
                           int cx = static_cast<int>(std::round(gridX + (c + 0.5f) * cellW));
                           int cy = static_cast<int>(std::round(gridY + (r + 0.5f) * cellH));
-                          float diffSum = 0.0f; int cnt = 0;
-                          for (int dy = -sampleRad; dy <= sampleRad; ++dy)
+                          float diffSum = 0.0f, colorMatchSum = 0.0f; int cnt = 0;
+                          for (int dy = -sampleRad; dy <= sampleRad; ++dy) {
                               for (int dx = -sampleRad; dx <= sampleRad; ++dx) {
                                   int idx = std::clamp(cy + dy, 0, bufH - 1) * bufW + std::clamp(cx + dx, 0, bufW - 1);
-                                  diffSum += computeColorDistance(preDragPixels[idx].r, preDragPixels[idx].g, preDragPixels[idx].b,
-                                                                  liveHoldPixels[idx].r, liveHoldPixels[idx].g, liveHoldPixels[idx].b);
+                                  const RGBAPixel& p0 = preDragPixels[idx];
+                                  const RGBAPixel& p1 = liveHoldPixels[idx];
+                                  float dPre = computeColorDistance(p0.r, p0.g, p0.b, p1.r, p1.g, p1.b);
+                                  float dPiece = computeColorDistance(p1.r, p1.g, p1.b, targetMove.piece.colorR, targetMove.piece.colorG, targetMove.piece.colorB);
+                                  diffSum += dPre;
+                                  if (dPiece < 72.0f) colorMatchSum += (72.0f - dPiece) * 0.65f;
                                   cnt++;
                               }
-                          cellDelta[r][c] = diffSum / std::max(1, cnt);
+                          }
+                          bool wasEmpty = (((preBoardBits >> (r * 8 + c)) & 1ULL) == 0ULL);
+                          float weight = wasEmpty ? 1.25f : 0.45f; // Uu tien o trong de khong bi nham voi hieu ung nhay sang cua hang sap xoa
+                          cellActivity[r][c] = ((diffSum + colorMatchSum) / std::max(1, cnt)) * weight;
                       }
                   }
 
                   int maxR = 8 - targetMove.piece.rows, maxC = 8 - targetMove.piece.cols;
                   float bestScore = -1e9f; int bestR = -1, bestC = -1;
+
                   for (int r = 0; r <= maxR; ++r) {
                       for (int c = 0; c <= maxC; ++c) {
-                          if (std::abs(r - targetMove.targetRow) > 3 || std::abs(c - targetMove.targetCol) > 3) continue;
-                          float insideSum = 0.0f, haloPenalty = 0.0f; int insideCnt = 0, haloCnt = 0;
+                          float insideSum = 0.0f, haloSum = 0.0f; int insideCnt = 0, haloCnt = 0;
                           for (int dr = -1; dr <= targetMove.piece.rows; ++dr) {
                               for (int dc = -1; dc <= targetMove.piece.cols; ++dc) {
                                   int br = r + dr, bc = c + dc;
                                   if (br < 0 || br >= 8 || bc < 0 || bc >= 8) continue;
                                   bool inMask = (dr >= 0 && dr < targetMove.piece.rows && dc >= 0 && dc < targetMove.piece.cols && targetMove.piece.getCell(dr, dc));
-                                  if (inMask) { insideSum += cellDelta[br][bc]; insideCnt++; }
-                                  else { haloPenalty += cellDelta[br][bc]; haloCnt++; }
+                                  if (inMask) { insideSum += cellActivity[br][bc]; insideCnt++; }
+                                  else { haloSum += cellActivity[br][bc]; haloCnt++; }
                               }
                           }
-                          float score = (insideSum / std::max(1, insideCnt)) - (haloPenalty / std::max(1, haloCnt)) * 0.55f;
+                          float score = (insideSum / std::max(1, insideCnt)) - (haloSum / std::max(1, haloCnt)) * 0.55f;
                           if (score > bestScore) { bestScore = score; bestR = r; bestC = c; }
                       }
                   }
-                  outDetectedRow = bestR; outDetectedCol = bestC; outConfidence = bestScore;
-                  return (bestR >= 0 && bestC >= 0 && bestScore >= 18.0f);
+                  outDetectedRow = bestR; outDetectedCol = bestC;
+                  return (bestR >= 0 && bestC >= 0 && bestScore >= 14.0f);
               }
           };
 
@@ -658,7 +673,7 @@ jobs:
 
           namespace BBAuto {
 
-          // 3. TOUCH SYNTHESIZER: KEO -> GIU KIEM TRA -> VI CHINH -> THA HOAC HUY AN TOAN
+          // 3. TOUCH SYNTHESIZER: BIEN KEO 1.65 -> TIM DUONG TRONG 3 GIAY -> KHOP HINH MO PHONG -> THA RA
           class TouchSynthesizer {
           public:
               CGPoint computeFingerHoldPoint(UIWindow* targetWindow, const PlacementMove& move, const CalibrationConfig& config, float extraOffsetRow, float extraOffsetCol) {
@@ -678,18 +693,18 @@ jobs:
                   CGFloat rawEndX = startX + (targetPieceCenterX - startX) / gainX;
                   CGFloat rawEndY = startY + ((targetPieceCenterY + config.dragLiftOffsetY) - startY) / gainY;
 
-                  return CGPointMake(std::clamp<double>(rawEndX, 16.0, winSize.width - 16.0),
-                                     std::clamp<double>(rawEndY, 50.0, winSize.height - 30.0));
+                  return CGPointMake(std::clamp<double>(rawEndX, 14.0, winSize.width - 14.0),
+                                     std::clamp<double>(rawEndY, 45.0, winSize.height - 25.0));
               }
 
               void beginAndDragToHoldPoint(UIWindow* targetWindow, CGPoint startPt, CGPoint holdPt, float speedMult) {
                   if (!targetWindow) return;
-                  int steps = std::clamp(static_cast<int>(std::round(22.0 / std::clamp(speedMult, 0.3f, 2.0f))), 14, 45);
+                  int steps = std::clamp(static_cast<int>(std::round(24.0 / std::clamp(speedMult, 0.3f, 2.0f))), 15, 48);
                   dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, startPt, UITouchPhaseBegan); });
-                  [NSThread sleepForTimeInterval:0.014];
-                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 1.8), UITouchPhaseMoved); });
-                  [NSThread sleepForTimeInterval:0.014];
-                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 3.5), UITouchPhaseMoved); });
+                  [NSThread sleepForTimeInterval:0.015];
+                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 2.0), UITouchPhaseMoved); });
+                  [NSThread sleepForTimeInterval:0.015];
+                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, CGPointMake(startPt.x, startPt.y - 4.0), UITouchPhaseMoved); });
 
                   for (int s = 1; s <= steps; ++s) {
                       [NSThread sleepForTimeInterval:0.012];
@@ -702,7 +717,7 @@ jobs:
               void moveHeldFingerSmoothly(UIWindow* targetWindow, CGPoint fromPt, CGPoint toPt, int subSteps) {
                   if (!targetWindow) return;
                   for (int s = 1; s <= subSteps; ++s) {
-                      [NSThread sleepForTimeInterval:0.014];
+                      [NSThread sleepForTimeInterval:0.015];
                       double t = static_cast<double>(s) / subSteps;
                       CGPoint curPt = CGPointMake(fromPt.x + (toPt.x - fromPt.x) * t, fromPt.y + (toPt.y - fromPt.y) * t);
                       dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, curPt, UITouchPhaseMoved); });
@@ -720,13 +735,6 @@ jobs:
                       dispatchSingleTouchPhase(targetWindow, dropPt, UITouchPhaseMoved);
                       dispatchSingleTouchPhase(targetWindow, dropPt, UITouchPhaseEnded);
                   });
-              }
-
-              void safeAbortDragToDock(UIWindow* targetWindow, CGPoint currentHoldPt, CGPoint dockStartPt) {
-                  if (!targetWindow) return;
-                  moveHeldFingerSmoothly(targetWindow, currentHoldPt, dockStartPt, 10);
-                  [NSThread sleepForTimeInterval:0.04];
-                  dispatch_sync(dispatch_get_main_queue(), ^{ dispatchSingleTouchPhase(targetWindow, dockStartPt, UITouchPhaseEnded); });
               }
 
           private:
@@ -867,6 +875,22 @@ jobs:
                           [rounded fill]; rounded.lineWidth = 2.4; [rounded stroke];
                       }
                   }
+
+                  // Ve vi tri khoi dang duoc keo tim duong (khung vien cam)
+                  if (_currentTelemetry.isSteeringHold && _currentTelemetry.liveHeldRow >= 0 && _currentTelemetry.liveHeldCol >= 0) {
+                      CGContextSetStrokeColorWithColor(ctx, [UIColor orangeColor].CGColor);
+                      CGContextSetLineWidth(ctx, 2.2);
+                      for (int r = 0; r < mv.piece.rows; ++r) {
+                          for (int c = 0; c < mv.piece.cols; ++c) {
+                              if (!mv.piece.getCell(r, c)) continue;
+                              int hr = _currentTelemetry.liveHeldRow + r, hc = _currentTelemetry.liveHeldCol + c;
+                              if (hr < 0 || hr >= 8 || hc < 0 || hc >= 8) continue;
+                              CGRect holdCell = CGRectMake(boardRect.origin.x + hc * cellW + 4.0, boardRect.origin.y + hr * cellH + 4.0, cellW - 8.0, cellH - 8.0);
+                              CGContextStrokeRect(ctx, holdCell);
+                          }
+                      }
+                  }
+
                   CGFloat startX = (mv.piece.centerNormX > 0.01f) ? (mv.piece.centerNormX * sz.width) : (dockRect.origin.x + (slot + 0.5) * slotW);
                   CGFloat startY = (mv.piece.centerNormY > 0.01f) ? (mv.piece.centerNormY * sz.height) : (dockRect.origin.y + dockRect.size.height * 0.5);
                   CGFloat targetCenterX = boardRect.origin.x + (mv.targetCol + mv.piece.cols * 0.5) * cellW;
@@ -997,8 +1021,8 @@ jobs:
               _boardWSlider = [self createConfigSlider:CGRectMake(92, 50, 164, 20) min:0.75f max:0.98f val:0.892f action:@selector(handleBoardWChanged:)];
               _dockYLabel = [self createConfigLabel:@"Dock Y: 0.686" frame:CGRectMake(0, 74, 88, 20)];
               _dockYSlider = [self createConfigSlider:CGRectMake(92, 74, 164, 20) min:0.60f max:0.88f val:0.686f action:@selector(handleDockYChanged:)];
-              _gainLabel = [self createConfigLabel:@"Bien keo: 1.25" frame:CGRectMake(0, 98, 88, 20)];
-              _gainSlider = [self createConfigSlider:CGRectMake(92, 98, 164, 20) min:0.85f max:1.85f val:1.25f action:@selector(handleGainChanged:)];
+              _gainLabel = [self createConfigLabel:@"Bien keo: 1.65" frame:CGRectMake(0, 98, 88, 20)];
+              _gainSlider = [self createConfigSlider:CGRectMake(92, 98, 164, 20) min:1.00f max:2.20f val:1.65f action:@selector(handleGainChanged:)];
               for (UIView* v in @[_liftYLabel, _liftYSlider, _boardYLabel, _boardYSlider, _boardWLabel, _boardWSlider, _dockYLabel, _dockYSlider, _gainLabel, _gainSlider])
                   [_configSubPanel addSubview:v];
           }
@@ -1158,7 +1182,7 @@ jobs:
           - (void)onOverlayAutoPlayClicked {
               _lockedGuidePlan.feasible = false;
               _runState.store(BBAuto::EngineRunState::AUTO_PLAYING);
-              _telemetry.statusMessage = "AUTO: Nhan dien & kiem chung...";
+              _telemetry.statusMessage = "AUTO: Keo 1.65 & tim duong 3s...";
               [self refreshUI];
               if (!_loopActive.exchange(true)) [self scheduleNextCycleWithDelay:0.12];
           }
@@ -1177,6 +1201,7 @@ jobs:
               _loopActive.store(false);
               _lockedGuidePlan.feasible = false;
               _telemetry.hasActiveGuideMove = false;
+              _telemetry.isSteeringHold = false;
               _telemetry.statusMessage = "Da dung";
               [self refreshUI];
           }
@@ -1225,258 +1250,68 @@ jobs:
               return snap1;
           }
 
-          - (bool)executeDragVerifyConfirmDrop:(UIWindow *)gameWindow
-                                          move:(const BBAuto::PlacementMove &)move
-                                 preDragPixels:(const std::vector<BBAuto::VisionAnalyzer::RGBAPixel> &)preDragPixels
-                                          bufW:(int)bufW
-                                          bufH:(int)bufH {
+          // KEO LEN VOI BIEN KEO 1.65 -> GIU 3 GIAY TIM DUONG DUA KHOI XEP CHO VAO DUNG HINH MO PHONG -> THA RA
+          - (bool)executeDragAndSteer3Seconds:(UIWindow *)gameWindow
+                                         move:(const BBAuto::PlacementMove &)move
+                                 preBoardBits:(uint64_t)preBoardBits
+                                preDragPixels:(const std::vector<BBAuto::VisionAnalyzer::RGBAPixel> &)preDragPixels
+                                         bufW:(int)bufW
+                                         bufH:(int)bufH {
               CGSize winSize = gameWindow.bounds.size;
               CGPoint startPt = CGPointMake(move.piece.centerNormX * winSize.width, move.piece.centerNormY * winSize.height);
               float corrRow = 0.0f, corrCol = 0.0f;
               CGPoint holdPt = _touch.computeFingerHoldPoint(gameWindow, move, _calibration, corrRow, corrCol);
 
-              _telemetry.statusMessage = "1. Keo & Giu (" + std::to_string(move.targetRow + 1) + "," + std::to_string(move.targetCol + 1) + ")...";
+              _telemetry.isSteeringHold = true;
+              _telemetry.liveHeldRow = -1;
+              _telemetry.liveHeldCol = -1;
+              _telemetry.statusMessage = "Keo len (1.65) -> Tim duong 3s...";
               [self refreshUI];
 
+              // 1. Keo khoi tu khay len ban co voi Bien keo = 1.65 va giu tay
               _touch.beginAndDragToHoldPoint(gameWindow, startPt, holdPt, _calibration.dragSpeedMultiplier);
 
-              int verifiedCount = 0;
-              bool positionConfirmed = false;
+              int matchedCounter = 0;
 
-              for (int attempt = 0; attempt < 4; ++attempt) {
+              // 2. Vong lap 3 GIAY (12 nhip x ~0.25s = 3.0s) de tim duong dua khoi xep cho vao khop hinh mo phong
+              for (int step = 0; step < 12; ++step) {
                   if (_runState.load() != BBAuto::EngineRunState::AUTO_PLAYING) {
-                      _touch.safeAbortDragToDock(gameWindow, holdPt, startPt);
+                      _touch.commitDropAtPoint(gameWindow, startPt);
+                      _telemetry.isSteeringHold = false;
                       return false;
                   }
+
                   _touch.sendHoldHeartbeat(gameWindow, holdPt);
-                  [NSThread sleepForTimeInterval:0.18];
+                  [NSThread sleepForTimeInterval:0.12];
                   _touch.sendHoldHeartbeat(gameWindow, holdPt);
+                  [NSThread sleepForTimeInterval:0.10];
 
                   std::vector<BBAuto::VisionAnalyzer::RGBAPixel> liveHoldPixels;
                   int liveH = 0;
                   if (BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, bufW, liveH, liveHoldPixels) && liveH == bufH) {
-                      int detRow = -1, detCol = -1; float conf = 0.0f;
-                      bool found = _vision.detectHeldPieceOnBoard(preDragPixels, liveHoldPixels, bufW, bufH, _calibration, move, detRow, detCol, conf);
+                      int detRow = -1, detCol = -1;
+                      bool found = _vision.detectHeldPieceOnBoard(preDragPixels, liveHoldPixels, bufW, bufH, preBoardBits, _calibration, move, detRow, detCol);
+
                       if (found) {
-                          int errRow = detRow - move.targetRow, errCol = detCol - move.targetCol;
+                          _telemetry.liveHeldRow = detRow;
+                          _telemetry.liveHeldCol = detCol;
+                          int errRow = detRow - move.targetRow;
+                          int errCol = detCol - move.targetCol;
+
                           if (errRow == 0 && errCol == 0) {
-                              verifiedCount++;
-                              _telemetry.statusMessage = "2. Kiem tra KHOP (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") [" + std::to_string(verifiedCount) + "/2]";
+                              matchedCounter++;
+                              _telemetry.statusMessage = "Khop mo phong (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") [" + std::to_string(step + 1) + "/12]";
                               [self refreshUI];
-                              if (verifiedCount >= 2) { positionConfirmed = true; break; }
-                          } else if (std::abs(errRow) <= 3 && std::abs(errCol) <= 3) {
-                              verifiedCount = 0;
-                              corrRow -= errRow * 0.85f;
-                              corrCol -= errCol * 0.85f;
+                              // Khi da nam gon trong hinh mo phong on dinh 3 nhip va qua it nhat ~1.5s thi co the tha hoac giu du
+                              if (matchedCounter >= 3 && step >= 6) break;
+                          } else {
+                              matchedCounter = 0;
+                              float stepR = std::clamp<float>(-errRow * 0.65f, -1.6f, 1.6f);
+                              float stepC = std::clamp<float>(-errCol * 0.65f, -1.6f, 1.6f);
+                              corrRow = std::clamp<float>(corrRow + stepR, -4.5f, 4.5f);
+                              corrCol = std::clamp<float>(corrCol + stepC, -4.5f, 4.5f);
+
                               CGPoint newHoldPt = _touch.computeFingerHoldPoint(gameWindow, move, _calibration, corrRow, corrCol);
-                              _telemetry.statusMessage = "2. Lech (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") -> Chinh...";
+                              _telemetry.statusMessage = "Tim duong (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") -> (" + std::to_string(move.targetRow + 1) + "," + std::to_string(move.targetCol + 1) + ")";
                               [self refreshUI];
-                              _touch.moveHeldFingerSmoothly(gameWindow, holdPt, newHoldPt, 6);
-                              holdPt = newHoldPt;
-                          }
-                      } else {
-                          verifiedCount++;
-                          if (verifiedCount >= 2) { positionConfirmed = true; break; }
-                      }
-                  }
-              }
-
-              if (positionConfirmed) {
-                  _telemetry.statusMessage = "3. XAC NHAN KHOP -> THA KHOI!";
-                  [self refreshUI];
-                  _touch.commitDropAtPoint(gameWindow, holdPt);
-                  _calibration.learnedBiasRow = std::clamp(_calibration.learnedBiasRow + corrRow * 0.35f, -2.0f, 2.0f);
-                  _calibration.learnedBiasCol = std::clamp(_calibration.learnedBiasCol + corrCol * 0.35f, -2.0f, 2.0f);
-                  return true;
-              } else {
-                  _telemetry.statusMessage = "3. Khong khop -> HUY KEO an toan!";
-                  [self refreshUI];
-                  _touch.safeAbortDragToDock(gameWindow, holdPt, startPt);
-                  return false;
-              }
-          }
-
-          - (void)scheduleNextCycleWithDelay:(double)delaySeconds {
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(delaySeconds * NSEC_PER_SEC)), _workerQueue, ^{ [self executeSolverCycle]; });
-          }
-
-          - (void)executeSolverCycle {
-              BBAuto::EngineRunState mode = _runState.load();
-              if (mode == BBAuto::EngineRunState::STOPPED) { _loopActive.store(false); return; }
-              UIWindow* gameWindow = [self findActiveGameWindow];
-              if (!gameWindow) { _telemetry.statusMessage = "Cho cua so game..."; [self refreshUI]; [self scheduleNextCycleWithDelay:0.5]; return; }
-
-              std::vector<BBAuto::VisionAnalyzer::RGBAPixel> preDragPixels;
-              int bufW = 360, bufH = 0;
-              BBAuto::VisionSnapshotResult snap = [self captureVerifiedSnapshot:gameWindow outRawPixels:preDragPixels outW:bufW outH:bufH];
-              if (!snap.success) { _telemetry.statusMessage = "Loi chup man hinh"; [self refreshUI]; [self scheduleNextCycleWithDelay:0.4]; return; }
-
-              _telemetry.lastDetectedBoard = snap.boardBits;
-              _telemetry.lastBoardConfidence = snap.boardConfidence;
-              int validPiecesCount = 0;
-              for (int i = 0; i < 3 && i < (int)snap.dockPieces.size(); ++i) {
-                  _telemetry.lastDetectedDock[i] = snap.dockPieces[i];
-                  if (snap.dockPieces[i].valid) validPiecesCount++;
-              }
-
-              if (validPiecesCount == 0) {
-                  _telemetry.hasActiveGuideMove = false;
-                  _telemetry.statusMessage = "Cho game phat 3 khoi moi...";
-                  [self refreshUI];
-                  [self scheduleNextCycleWithDelay:0.25];
-                  return;
-              }
-
-              if (mode == BBAuto::EngineRunState::GUIDE_PLAYING) {
-                  if (_lockedGuidePlan.feasible && _lockedGuideStepIdx < (int)_lockedGuidePlan.moves.size()) {
-                      const BBAuto::PlacementMove& activeMv = _lockedGuidePlan.moves[_lockedGuideStepIdx];
-                      int slot = activeMv.slotIndex;
-                      bool slotEmptyNow = (slot >= 0 && slot < 3 && !snap.dockPieces[slot].valid);
-                      bool targetCellsFilled = ((snap.boardBits & activeMv.rawMaskOnBoard) == activeMv.rawMaskOnBoard);
-                      bool lineClearedMatch = (activeMv.linesCleared > 0 && snap.boardBits == activeMv.expectedBoardAfter);
-
-                      if (slotEmptyNow && (targetCellsFilled || lineClearedMatch)) {
-                          if (++_placementConfirmCounter >= 2) {
-                              _placementConfirmCounter = 0; _telemetry.movesExecuted++;
-                              if (activeMv.linesCleared > 0) { _telemetry.totalLinesCleared += activeMv.linesCleared; _telemetry.currentCombo++; _telemetry.movesSinceLastClear = 0; }
-                              else if (++_telemetry.movesSinceLastClear >= 3) _telemetry.currentCombo = 0;
-                              _lockedGuideStepIdx++; _boardBeforeGuideStep = snap.boardBits;
-                              if (_lockedGuideStepIdx < (int)_lockedGuidePlan.moves.size()) {
-                                  const auto& nextMv = _lockedGuidePlan.moves[_lockedGuideStepIdx];
-                                  _telemetry.hasActiveGuideMove = true; _telemetry.currentGuideMove = nextMv;
-                                  _telemetry.guideStepIndex = _lockedGuideStepIdx; _telemetry.guideTotalSteps = (int)_lockedGuidePlan.moves.size();
-                                  _telemetry.statusMessage = "Buoc " + std::to_string(_lockedGuideStepIdx + 1) + "/" + std::to_string(_telemetry.guideTotalSteps) + ": Keo khay " + std::to_string(nextMv.slotIndex + 1);
-                                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return;
-                              } else {
-                                  _telemetry.turnsExecuted++; _lockedGuidePlan.feasible = false; _telemetry.hasActiveGuideMove = false;
-                                  _telemetry.statusMessage = "Xong luot! Cho 3 khoi moi...";
-                                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.25]; return;
-                              }
-                          }
-                      } else if (slotEmptyNow && snap.boardBits != _boardBeforeGuideStep) {
-                          _lockedGuidePlan.feasible = false; _placementConfirmCounter = 0;
-                      } else _placementConfirmCounter = 0;
-                      if (_lockedGuidePlan.feasible) { [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return; }
-                  }
-
-                  BBAuto::TurnPlan plan = _solver.solveTurn(snap.boardBits, snap.dockPieces, _telemetry.currentCombo, _telemetry.movesSinceLastClear, _telemetry.requestedStrategy);
-                  _telemetry.effectiveStrategy = plan.activeStrategy; _telemetry.lastValidSequences = plan.validSequencesFound;
-                  if (!plan.feasible || plan.moves.empty()) {
-                      _telemetry.hasActiveGuideMove = false;
-                      _telemetry.statusMessage = "Dang kiem tra lai ban co...";
-                      [self refreshUI]; [self scheduleNextCycleWithDelay:0.35]; return;
-                  }
-                  _lockedGuidePlan = plan; _lockedGuideStepIdx = 0; _boardBeforeGuideStep = snap.boardBits; _placementConfirmCounter = 0;
-                  const auto& mv0 = _lockedGuidePlan.moves[0];
-                  _telemetry.hasActiveGuideMove = true; _telemetry.currentGuideMove = mv0; _telemetry.guideStepIndex = 0; _telemetry.guideTotalSteps = (int)_lockedGuidePlan.moves.size();
-                  _telemetry.statusMessage = "Buoc 1/" + std::to_string(_telemetry.guideTotalSteps) + ": Keo khay " + std::to_string(mv0.slotIndex + 1);
-                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return;
-              }
-
-              // CHE DO AUTO CHOI: TINH TOAN -> MO PHONG -> KEO GIU KIEM TRA 1S -> XAC NHAN -> THA -> DOI CHIEU SAU KHI THA
-              BBAuto::TurnPlan plan = _solver.solveTurn(snap.boardBits, snap.dockPieces, _telemetry.currentCombo, _telemetry.movesSinceLastClear, _telemetry.requestedStrategy);
-              _telemetry.effectiveStrategy = plan.activeStrategy;
-              _telemetry.lastValidSequences = plan.validSequencesFound;
-
-              if (!plan.feasible || plan.moves.empty()) {
-                  _telemetry.hasActiveGuideMove = false;
-                  _telemetry.statusMessage = "Kiem tra lai ban co (tranh bao sai)...";
-                  [self refreshUI];
-                  [self scheduleNextCycleWithDelay:0.45];
-                  return;
-              }
-
-              const BBAuto::PlacementMove firstMove = plan.moves.front();
-              int prevSlot = firstMove.slotIndex;
-              _telemetry.hasActiveGuideMove = true;
-              _telemetry.currentGuideMove = firstMove;
-              _telemetry.guideStepIndex = 0;
-              _telemetry.guideTotalSteps = (int)plan.moves.size();
-              [self refreshUI];
-
-              bool dropped = [self executeDragVerifyConfirmDrop:gameWindow move:firstMove preDragPixels:preDragPixels bufW:bufW bufH:bufH];
-              if (!dropped) {
-                  [self scheduleNextCycleWithDelay:0.30];
-                  return;
-              }
-
-              [NSThread sleepForTimeInterval:(firstMove.linesCleared > 0) ? 0.42 : 0.25];
-              if (_runState.load() != BBAuto::EngineRunState::AUTO_PLAYING) { _loopActive.store(false); return; }
-
-              // Doi chieu trang thai ban co sau khi tha voi expectedBoardAfter
-              BBAuto::VisionSnapshotResult postSnap = _vision.analyzeCurrentScreen(gameWindow, _overlayWindow, _calibration);
-              bool slotConsumed = (prevSlot >= 0 && prevSlot < 3 && !postSnap.dockPieces[prevSlot].valid);
-              bool exactMatch = (postSnap.boardBits == firstMove.expectedBoardAfter);
-
-              if (slotConsumed || postSnap.boardBits != snap.boardBits) {
-                  if (!exactMatch && firstMove.linesCleared == 0) {
-                      uint64_t addedBits = postSnap.boardBits & ~snap.boardBits;
-                      if (BBAuto::popcount64(addedBits) == firstMove.piece.cellCount) {
-                          int minR = 8, minC = 8;
-                          for (int r = 0; r < 8; ++r)
-                              for (int c = 0; c < 8; ++c)
-                                  if ((addedBits >> (r * 8 + c)) & 1ULL) { minR = std::min(minR, r); minC = std::min(minC, c); }
-                          int errR = minR - firstMove.targetRow, errC = minC - firstMove.targetCol;
-                          if (std::abs(errR) <= 2 && std::abs(errC) <= 2) {
-                              _calibration.learnedBiasRow = std::clamp(_calibration.learnedBiasRow - errR * 0.6f, -2.0f, 2.0f);
-                              _calibration.learnedBiasCol = std::clamp(_calibration.learnedBiasCol - errC * 0.6f, -2.0f, 2.0f);
-                          }
-                      }
-                  }
-                  _telemetry.movesExecuted++;
-                  if (_telemetry.movesExecuted % 3 == 0) _telemetry.turnsExecuted++;
-                  if (firstMove.linesCleared > 0) { _telemetry.totalLinesCleared += firstMove.linesCleared; _telemetry.currentCombo++; _telemetry.movesSinceLastClear = 0; }
-                  else if (++_telemetry.movesSinceLastClear >= 3) _telemetry.currentCombo = 0;
-                  _telemetry.statusMessage = exactMatch ? "4. Dong bo ban co KHOP 100%!" : "4. Da cap nhat ban co moi!";
-                  [self refreshUI];
-                  [self scheduleNextCycleWithDelay:0.12];
-              } else {
-                  _telemetry.statusMessage = "Chua an khoi -> Quet lai ban co";
-                  [self refreshUI];
-                  [self scheduleNextCycleWithDelay:0.25];
-              }
-          }
-          @end
-
-          __attribute__((constructor))
-          static void initializeBlockBlastAutoDylib() {
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                  [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
-                      [[BBAutoPlayController sharedInstance] attachToApplicationWindow];
-                  }];
-              });
-          }
-          EOF
-
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun -sdk iphoneos clang++ \
-            -arch arm64 \
-            -dynamiclib \
-            -std=c++17 \
-            -fobjc-arc \
-            -O3 \
-            -mios-version-min=14.0 \
-            -isysroot "$SDK_PATH" \
-            -Wl,-install_name,@rpath/BlockBlastAuto.dylib \
-            -framework UIKit \
-            -framework Foundation \
-            -framework CoreGraphics \
-            -framework QuartzCore \
-            BlockBlastAuto.mm \
-            -o BlockBlastAuto.dylib
-
-          ldid -S BlockBlastAuto.dylib
-          rm -f BlockBlastAuto.mm
-
-      - name: Commit BlockBlastAuto.dylib directly to Repository
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f BlockBlastAuto.dylib
-          git diff --staged --quiet || (git commit -m "Build BlockBlastAuto.dylib [skip ci]" && git push)
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: BlockBlastAuto-dylib
-          path: BlockBlastAuto.dylib
+                              _touch.mov
