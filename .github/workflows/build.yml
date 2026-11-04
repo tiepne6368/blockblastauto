@@ -9,9 +9,6 @@ on:
 permissions:
   contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build-ios-dylib:
     runs-on: macos-latest
@@ -20,9 +17,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install ldid signer
-        run: brew install ldid
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ldid || true
 
-      - name: Write and Compile Upgraded BlockBlastAuto.mm
+      - name: Compile BlockBlastAuto.dylib
         run: |
           cat << 'EOF' > BlockBlastAuto.mm
           #import <UIKit/UIKit.h>
@@ -45,11 +42,17 @@ jobs:
           enum class EngineRunState : int { STOPPED = 0, AUTO_PLAYING = 1, GUIDE_PLAYING = 2 };
 
           struct PieceShape {
-              int slotIndex = -1, rows = 0, cols = 0, cellCount = 0;
+              int slotIndex = -1;
+              int rows = 0;
+              int cols = 0;
+              int cellCount = 0;
               uint32_t localMask = 0;
               bool valid = false;
-              float centerNormX = 0.0f, centerNormY = 0.0f;
-              float colorR = 220.0f, colorG = 220.0f, colorB = 220.0f;
+              float centerNormX = 0.0f;
+              float centerNormY = 0.0f;
+              float colorR = 220.0f;
+              float colorG = 220.0f;
+              float colorB = 220.0f;
 
               bool getCell(int r, int c) const {
                   if (r < 0 || r >= rows || c < 0 || c >= cols) return false;
@@ -65,43 +68,61 @@ jobs:
           struct PlacementMove {
               int slotIndex = -1;
               PieceShape piece;
-              int targetRow = 0, targetCol = 0;
-              uint64_t rawMaskOnBoard = 0ULL, expectedBoardAfter = 0ULL;
+              int targetRow = 0;
+              int targetCol = 0;
+              uint64_t rawMaskOnBoard = 0ULL;
+              uint64_t expectedBoardAfter = 0ULL;
               int linesCleared = 0;
               bool valid = false;
           };
 
           struct TurnPlan {
+              std::vector<PieceShape> usedPieces;
               std::vector<PlacementMove> moves;
               double totalScore = -1e18;
-              int totalLinesCleared = 0, validSequencesFound = 0, survivalTier = 0;
+              int totalLinesCleared = 0;
+              int validSequencesFound = 0;
+              int survivalTier = 0;
               PlayStrategy activeStrategy = PlayStrategy::AUTO_MODE;
               bool feasible = false;
           };
 
           struct CalibrationConfig {
-              float boardX = 0.054f, boardY = 0.235f, boardW = 0.892f;
+              float boardX = 0.054f;
+              float boardY = 0.235f;
+              float boardW = 0.892f;
               float gridBorderRatio = 0.018f;
-              float dockX = 0.035f, dockY = 0.686f, dockW = 0.930f, dockH = 0.160f;
+              float dockX = 0.035f;
+              float dockY = 0.686f;
+              float dockW = 0.930f;
+              float dockH = 0.160f;
               float dockCellScale = 0.45f;
               float dragLiftOffsetY = 112.0f;
               float dragSpeedMultiplier = 0.80f;
-              float dragGainX = 1.65f, dragGainY = 1.65f;
-              float learnedBiasRow = 0.0f, learnedBiasCol = 0.0f;
+              float dragGainX = 1.65f;
+              float dragGainY = 1.65f;
+              float learnedBiasRow = 0.0f;
+              float learnedBiasCol = 0.0f;
               bool showCalibrationOverlay = false;
           };
 
           struct RuntimeTelemetry {
-              int turnsExecuted = 0, movesExecuted = 0, totalLinesCleared = 0;
-              int currentCombo = 0, movesSinceLastClear = 0, lastValidSequences = 0;
+              int turnsExecuted = 0;
+              int movesExecuted = 0;
+              int totalLinesCleared = 0;
+              int currentCombo = 0;
+              int movesSinceLastClear = 0;
+              int lastValidSequences = 0;
               float lastBoardConfidence = 1.0f;
               uint64_t lastDetectedBoard = 0ULL;
               std::array<PieceShape, 3> lastDetectedDock;
               bool hasActiveGuideMove = false;
               PlacementMove currentGuideMove;
-              int guideStepIndex = 0, guideTotalSteps = 0;
+              int guideStepIndex = 0;
+              int guideTotalSteps = 0;
               bool isSteeringHold = false;
-              int liveHeldRow = -1, liveHeldCol = -1;
+              int liveHeldRow = -1;
+              int liveHeldCol = -1;
               PlayStrategy requestedStrategy = PlayStrategy::AUTO_MODE;
               PlayStrategy effectiveStrategy = PlayStrategy::MAX_SURVIVAL;
               std::string statusMessage = "San sang";
@@ -109,7 +130,6 @@ jobs:
 
           inline int popcount64(uint64_t x) { return __builtin_popcountll(x); }
 
-          // 1. BLOCK SOLVER: UU TIEN 1. SURVIVAL -> 2. FUTURE MOVES -> 3. COMBO -> 4. SCORE
           class BlockSolver {
           public:
               BlockSolver() { initMasks(); }
@@ -172,7 +192,8 @@ jobs:
                       uint64_t board;
                       std::array<PlacementMove, 3> moves;
                       std::array<int, 3> clearAtStep;
-                      int totalCleared = 0, survivalTier = 0;
+                      int totalCleared = 0;
+                      int survivalTier = 0;
                       double score = -1e18;
                   };
 
@@ -181,7 +202,13 @@ jobs:
                   TurnPlan fallbackPartialPlan;
 
                   do {
-                      std::vector<SearchNode> currentBeam = {{currentBoard, {}, {0, 0, 0}, 0, 0, 0.0}};
+                      std::vector<SearchNode> currentBeam;
+                      SearchNode root;
+                      root.board = currentBoard;
+                      root.clearAtStep = {0, 0, 0};
+                      root.score = 0.0;
+                      currentBeam.push_back(root);
+
                       for (int step = 0; step < N; ++step) {
                           const PieceShape& piece = activePieces[perm[step]];
                           std::vector<SearchNode> nextBeam;
@@ -199,7 +226,18 @@ jobs:
                                       child.board = nextBoard;
                                       child.clearAtStep[step] = cleared;
                                       child.totalCleared = node.totalCleared + cleared;
-                                      child.moves[step] = {piece.slotIndex, piece, r, c, mask, nextBoard, cleared, true};
+
+                                      PlacementMove mv;
+                                      mv.slotIndex = piece.slotIndex;
+                                      mv.piece = piece;
+                                      mv.targetRow = r;
+                                      mv.targetCol = c;
+                                      mv.rawMaskOnBoard = mask;
+                                      mv.expectedBoardAfter = nextBoard;
+                                      mv.linesCleared = cleared;
+                                      mv.valid = true;
+                                      child.moves[step] = mv;
+
                                       child.score = evaluateState(nextBoard, child.totalCleared, child.clearAtStep,
                                                                   step + 1, N, currentCombo, movesSinceLastClear,
                                                                   effectiveStrategy, child.survivalTier);
@@ -369,7 +407,6 @@ jobs:
               }
           };
 
-          // 2. VISION ANALYZER: NHAN DIEN NEN XAM + TIM DUONG KHOI XEP CHO TRONG 3 GIAY
           struct VisionSnapshotResult {
               bool success = false;
               uint64_t boardBits = 0ULL;
@@ -387,7 +424,8 @@ jobs:
               }
 
               static float computeSaturation(float r, float g, float b) {
-                  float mx = std::max({r, g, b}), mn = std::min({r, g, b});
+                  float mx = std::max(r, std::max(g, b));
+                  float mn = std::min(r, std::min(g, b));
                   return (mx < 1.0f) ? 0.0f : ((mx - mn) / mx);
               }
 
@@ -534,7 +572,10 @@ jobs:
                           tlLum /= bCnt; brLum /= bCnt;
                           float bevelRelief = std::abs(tlLum - brLum) + std::abs(tlLum - avgLum) * 0.5f;
                           float flatness = innerStd * 1.6f + bevelRelief * 1.1f + sat * 38.0f;
-                          feats[r * 8 + c] = {avgR, avgG, avgB, avgLum, sat, innerStd, bevelRelief, flatness};
+                          CellFeatures cf;
+                          cf.r = avgR; cf.g = avgG; cf.b = avgB; cf.lum = avgLum;
+                          cf.sat = sat; cf.innerStdDev = innerStd; cf.bevelRelief = bevelRelief; cf.flatnessMetric = flatness;
+                          feats[r * 8 + c] = cf;
                       }
                   }
 
@@ -590,11 +631,11 @@ jobs:
               VisionSnapshotResult analyzeCurrentScreen(UIWindow* gameWindow, UIWindow* overlayWindowToIgnore, const CalibrationConfig& config) {
                   int bufW = 360, bufH = 0;
                   std::vector<RGBAPixel> pixels;
-                  if (!captureWindowPixels(gameWindow, overlayWindowToIgnore, bufW, bufH, pixels)) return {};
+                  VisionSnapshotResult emptyRes;
+                  if (!captureWindowPixels(gameWindow, overlayWindowToIgnore, bufW, bufH, pixels)) return emptyRes;
                   return analyzePixels(pixels, bufW, bufH, config);
               }
 
-              // Quet toan bo ban co 8x8 de tim vi tri thuc te cua khoi xep cho dang duoc keo tren man hinh
               bool detectHeldPieceOnBoard(const std::vector<RGBAPixel>& preDragPixels, const std::vector<RGBAPixel>& liveHoldPixels,
                                           int bufW, int bufH, uint64_t preBoardBits, const CalibrationConfig& config,
                                           const PlacementMove& targetMove, int& outDetectedRow, int& outDetectedCol) {
@@ -625,7 +666,7 @@ jobs:
                               }
                           }
                           bool wasEmpty = (((preBoardBits >> (r * 8 + c)) & 1ULL) == 0ULL);
-                          float weight = wasEmpty ? 1.25f : 0.45f; // Uu tien o trong de khong bi nham voi hieu ung nhay sang cua hang sap xoa
+                          float weight = wasEmpty ? 1.25f : 0.45f;
                           cellActivity[r][c] = ((diffSum + colorMatchSum) / std::max(1, cnt)) * weight;
                       }
                   }
@@ -673,7 +714,6 @@ jobs:
 
           namespace BBAuto {
 
-          // 3. TOUCH SYNTHESIZER: BIEN KEO 1.65 -> TIM DUONG TRONG 3 GIAY -> KHOP HINH MO PHONG -> THA RA
           class TouchSynthesizer {
           public:
               CGPoint computeFingerHoldPoint(UIWindow* targetWindow, const PlacementMove& move, const CalibrationConfig& config, float extraOffsetRow, float extraOffsetCol) {
@@ -876,7 +916,6 @@ jobs:
                       }
                   }
 
-                  // Ve vi tri khoi dang duoc keo tim duong (khung vien cam)
                   if (_currentTelemetry.isSteeringHold && _currentTelemetry.liveHeldRow >= 0 && _currentTelemetry.liveHeldCol >= 0) {
                       CGContextSetStrokeColorWithColor(ctx, [UIColor orangeColor].CGColor);
                       CGContextSetLineWidth(ctx, 2.2);
@@ -1070,248 +1109,4 @@ jobs:
           - (void)toggleConfigPanel {
               if (_isMinimized) return;
               _showAdvancedConfig = !_showAdvancedConfig;
-              _configSubPanel.hidden = !_showAdvancedConfig;
-              _mainControlGroup.hidden = _showAdvancedConfig;
-              [_configToggleBtn setTitle:(_showAdvancedConfig ? @"Chinh" : @"Cai dat") forState:UIControlStateNormal];
-          }
-
-          - (void)handleAutoPlay { [self.controlDelegate onOverlayAutoPlayClicked]; }
-          - (void)handleGuideMode { [self.controlDelegate onOverlayGuideModeClicked]; }
-          - (void)handleStop { [self.controlDelegate onOverlayStopClicked]; }
-          - (void)handleStrategySegment:(UISegmentedControl *)seg { [self.controlDelegate onOverlayStrategyChanged:static_cast<BBAuto::PlayStrategy>(seg.selectedSegmentIndex)]; }
-          - (void)handleGainChanged:(UISlider *)s { _gainLabel.text = [NSString stringWithFormat:@"Bien keo: %.2f", s.value]; [self.controlDelegate onOverlayGainChanged:s.value]; }
-          - (void)handleLiftYChanged:(UISlider *)s { _liftYLabel.text = [NSString stringWithFormat:@"Nang Y: %.0f", s.value]; [self.controlDelegate onOverlayLiftYChanged:s.value]; }
-          - (void)handleBoardYChanged:(UISlider *)s { _boardYLabel.text = [NSString stringWithFormat:@"Ban Y: %.3f", s.value]; [self.controlDelegate onOverlayBoardYChanged:s.value]; }
-          - (void)handleBoardWChanged:(UISlider *)s { _boardWLabel.text = [NSString stringWithFormat:@"Ban W: %.3f", s.value]; [self.controlDelegate onOverlayBoardWChanged:s.value]; }
-          - (void)handleDockYChanged:(UISlider *)s { _dockYLabel.text = [NSString stringWithFormat:@"Dock Y: %.3f", s.value]; [self.controlDelegate onOverlayDockYChanged:s.value]; }
-          - (void)handleCalibToggle { [self.controlDelegate onOverlayToggleCalibrationFrame:!_guideView.currentConfig.showCalibrationOverlay]; }
-
-          - (void)updateTelemetry:(const BBAuto::RuntimeTelemetry&)telemetry runState:(BBAuto::EngineRunState)runState calibration:(const BBAuto::CalibrationConfig&)config {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  self->_guideView.currentConfig = config;
-                  self->_guideView.currentTelemetry = telemetry;
-                  self->_guideView.currentRunState = runState;
-                  [self->_guideView setNeedsDisplay];
-                  NSString* stratStr = (telemetry.effectiveStrategy == BBAuto::PlayStrategy::MAX_SURVIVAL) ? @"SURVIVAL" : @"COMBO+SURV";
-                  self->_statsLabel.text = [NSString stringWithFormat:@"Luot: %d | Xoa: %d | Combo: %d\nPA: %d | Uu tien: %@",
-                      telemetry.turnsExecuted, telemetry.totalLinesCleared, telemetry.currentCombo, telemetry.lastValidSequences, stratStr];
-                  self->_statusLabel.text = [NSString stringWithFormat:@"TT: %s", telemetry.statusMessage.c_str()];
-              });
-          }
-          @end
-
-          @interface BBAutoPlayController : NSObject <BBAutoOverlayDelegate>
-          + (instancetype)sharedInstance;
-          - (void)attachToApplicationWindow;
-          @end
-
-          @implementation BBAutoPlayController {
-              BBAutoOverlayWindow* _overlayWindow;
-              dispatch_queue_t _workerQueue;
-              BBAuto::BlockSolver _solver;
-              BBAuto::VisionAnalyzer _vision;
-              BBAuto::TouchSynthesizer _touch;
-              BBAuto::CalibrationConfig _calibration;
-              BBAuto::RuntimeTelemetry _telemetry;
-              std::atomic<BBAuto::EngineRunState> _runState;
-              std::atomic<bool> _loopActive;
-              BBAuto::TurnPlan _lockedGuidePlan;
-              int _lockedGuideStepIdx, _placementConfirmCounter;
-              uint64_t _boardBeforeGuideStep;
-          }
-
-          + (instancetype)sharedInstance {
-              static BBAutoPlayController* instance = nil;
-              static dispatch_once_t onceToken;
-              dispatch_once(&onceToken, ^{ instance = [[BBAutoPlayController alloc] init]; });
-              return instance;
-          }
-
-          - (instancetype)init {
-              if (self = [super init]) {
-                  _workerQueue = dispatch_queue_create("com.autoplay.blockblast.worker", DISPATCH_QUEUE_SERIAL);
-                  _runState.store(BBAuto::EngineRunState::STOPPED);
-                  _loopActive.store(false);
-              }
-              return self;
-          }
-
-          - (UIWindow *)findActiveGameWindow {
-              __block UIWindow* foundWindow = nil;
-              auto finder = ^{
-                  NSMutableArray<UIWindow*>* allWindows = [NSMutableArray array];
-                  if (@available(iOS 13.0, *)) {
-                      for (UIScene* scene in [UIApplication sharedApplication].connectedScenes)
-                          if ([scene isKindOfClass:[UIWindowScene class]])
-                              [allWindows addObjectsFromArray:((UIWindowScene*)scene).windows];
-                  }
-                  if (allWindows.count == 0) [allWindows addObjectsFromArray:[[UIApplication sharedApplication] windows]];
-                  for (UIWindow* win in allWindows) {
-                      if (win == self->_overlayWindow) continue;
-                      if (!win.hidden && win.alpha > 0.01 && CGRectGetWidth(win.bounds) > 200) { foundWindow = win; break; }
-                  }
-              };
-              if ([NSThread isMainThread]) finder();
-              else dispatch_sync(dispatch_get_main_queue(), finder);
-              return foundWindow;
-          }
-
-          - (void)attachToApplicationWindow {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  UIWindow* gameWin = [self findActiveGameWindow];
-                  if (!gameWin) return;
-                  BOOL isNew = NO;
-                  if (!self->_overlayWindow) {
-                      self->_overlayWindow = [[BBAutoOverlayWindow alloc] initWithFrame:gameWin.bounds];
-                      self->_overlayWindow.controlDelegate = self;
-                      isNew = YES;
-                  }
-                  if (@available(iOS 13.0, *)) {
-                      if (gameWin.windowScene && self->_overlayWindow.windowScene != gameWin.windowScene)
-                          self->_overlayWindow.windowScene = gameWin.windowScene;
-                  }
-                  self->_overlayWindow.hidden = NO;
-                  if (isNew) [self refreshUI];
-              });
-          }
-
-          - (void)refreshUI {
-              if (_overlayWindow) [_overlayWindow updateTelemetry:_telemetry runState:_runState.load() calibration:_calibration];
-          }
-
-          - (void)onOverlayAutoPlayClicked {
-              _lockedGuidePlan.feasible = false;
-              _runState.store(BBAuto::EngineRunState::AUTO_PLAYING);
-              _telemetry.statusMessage = "AUTO: Keo 1.65 & tim duong 3s...";
-              [self refreshUI];
-              if (!_loopActive.exchange(true)) [self scheduleNextCycleWithDelay:0.12];
-          }
-
-          - (void)onOverlayGuideModeClicked {
-              _lockedGuidePlan.feasible = false;
-              _lockedGuideStepIdx = 0; _placementConfirmCounter = 0;
-              _runState.store(BBAuto::EngineRunState::GUIDE_PLAYING);
-              _telemetry.statusMessage = "HDAN CHOI: Mo phong chinh xac...";
-              [self refreshUI];
-              if (!_loopActive.exchange(true)) [self scheduleNextCycleWithDelay:0.10];
-          }
-
-          - (void)onOverlayStopClicked {
-              _runState.store(BBAuto::EngineRunState::STOPPED);
-              _loopActive.store(false);
-              _lockedGuidePlan.feasible = false;
-              _telemetry.hasActiveGuideMove = false;
-              _telemetry.isSteeringHold = false;
-              _telemetry.statusMessage = "Da dung";
-              [self refreshUI];
-          }
-
-          - (void)onOverlayStrategyChanged:(BBAuto::PlayStrategy)newStrategy { _telemetry.requestedStrategy = newStrategy; _lockedGuidePlan.feasible = false; [self refreshUI]; }
-          - (void)onOverlayGainChanged:(float)newGain { _calibration.dragGainX = newGain; _calibration.dragGainY = newGain; _calibration.learnedBiasRow = 0; _calibration.learnedBiasCol = 0; }
-          - (void)onOverlayLiftYChanged:(float)newLiftY { _calibration.dragLiftOffsetY = newLiftY; _calibration.learnedBiasRow = 0; }
-          - (void)onOverlayBoardYChanged:(float)newBoardY { _calibration.boardY = newBoardY; [self triggerLiveDetection]; }
-          - (void)onOverlayBoardWChanged:(float)newBoardW { _calibration.boardW = newBoardW; _calibration.boardX = (1.0f - newBoardW) * 0.5f; [self triggerLiveDetection]; }
-          - (void)onOverlayDockYChanged:(float)newDockY { _calibration.dockY = newDockY; [self triggerLiveDetection]; }
-          - (void)onOverlayToggleCalibrationFrame:(BOOL)visible { _calibration.showCalibrationOverlay = visible; [self triggerLiveDetection]; }
-
-          - (void)triggerLiveDetection {
-              dispatch_async(_workerQueue, ^{
-                  UIWindow* gameWin = [self findActiveGameWindow];
-                  if (gameWin) {
-                      BBAuto::VisionSnapshotResult snap = self->_vision.analyzeCurrentScreen(gameWin, self->_overlayWindow, self->_calibration);
-                      if (snap.success) {
-                          self->_telemetry.lastDetectedBoard = snap.boardBits;
-                          for (int i = 0; i < 3 && i < (int)snap.dockPieces.size(); ++i) self->_telemetry.lastDetectedDock[i] = snap.dockPieces[i];
-                      }
-                  }
-                  [self refreshUI];
-              });
-          }
-
-          - (BBAuto::VisionSnapshotResult)captureVerifiedSnapshot:(UIWindow *)gameWindow outRawPixels:(std::vector<BBAuto::VisionAnalyzer::RGBAPixel> &)outPixels outW:(int &)outW outH:(int &)outH {
-              outW = 360; outH = 0;
-              BBAuto::VisionSnapshotResult snap1, snap2;
-              if (!BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, outW, outH, outPixels)) return snap1;
-              snap1 = _vision.analyzePixels(outPixels, outW, outH, _calibration);
-
-              if (snap1.boardConfidence < 0.45f || BBAuto::popcount64(snap1.boardBits) >= 54 || !_solver.hasAnySingleValidMove(snap1.boardBits, snap1.dockPieces)) {
-                  [NSThread sleepForTimeInterval:0.12];
-                  std::vector<BBAuto::VisionAnalyzer::RGBAPixel> pixels2;
-                  int h2 = 0;
-                  if (BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, outW, h2, pixels2)) {
-                      snap2 = _vision.analyzePixels(pixels2, outW, h2, _calibration);
-                      if (snap2.success) {
-                          snap1.boardBits &= snap2.boardBits;
-                          outPixels = std::move(pixels2);
-                          outH = h2;
-                      }
-                  }
-              }
-              return snap1;
-          }
-
-          // KEO LEN VOI BIEN KEO 1.65 -> GIU 3 GIAY TIM DUONG DUA KHOI XEP CHO VAO DUNG HINH MO PHONG -> THA RA
-          - (bool)executeDragAndSteer3Seconds:(UIWindow *)gameWindow
-                                         move:(const BBAuto::PlacementMove &)move
-                                 preBoardBits:(uint64_t)preBoardBits
-                                preDragPixels:(const std::vector<BBAuto::VisionAnalyzer::RGBAPixel> &)preDragPixels
-                                         bufW:(int)bufW
-                                         bufH:(int)bufH {
-              CGSize winSize = gameWindow.bounds.size;
-              CGPoint startPt = CGPointMake(move.piece.centerNormX * winSize.width, move.piece.centerNormY * winSize.height);
-              float corrRow = 0.0f, corrCol = 0.0f;
-              CGPoint holdPt = _touch.computeFingerHoldPoint(gameWindow, move, _calibration, corrRow, corrCol);
-
-              _telemetry.isSteeringHold = true;
-              _telemetry.liveHeldRow = -1;
-              _telemetry.liveHeldCol = -1;
-              _telemetry.statusMessage = "Keo len (1.65) -> Tim duong 3s...";
-              [self refreshUI];
-
-              // 1. Keo khoi tu khay len ban co voi Bien keo = 1.65 va giu tay
-              _touch.beginAndDragToHoldPoint(gameWindow, startPt, holdPt, _calibration.dragSpeedMultiplier);
-
-              int matchedCounter = 0;
-
-              // 2. Vong lap 3 GIAY (12 nhip x ~0.25s = 3.0s) de tim duong dua khoi xep cho vao khop hinh mo phong
-              for (int step = 0; step < 12; ++step) {
-                  if (_runState.load() != BBAuto::EngineRunState::AUTO_PLAYING) {
-                      _touch.commitDropAtPoint(gameWindow, startPt);
-                      _telemetry.isSteeringHold = false;
-                      return false;
-                  }
-
-                  _touch.sendHoldHeartbeat(gameWindow, holdPt);
-                  [NSThread sleepForTimeInterval:0.12];
-                  _touch.sendHoldHeartbeat(gameWindow, holdPt);
-                  [NSThread sleepForTimeInterval:0.10];
-
-                  std::vector<BBAuto::VisionAnalyzer::RGBAPixel> liveHoldPixels;
-                  int liveH = 0;
-                  if (BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, bufW, liveH, liveHoldPixels) && liveH == bufH) {
-                      int detRow = -1, detCol = -1;
-                      bool found = _vision.detectHeldPieceOnBoard(preDragPixels, liveHoldPixels, bufW, bufH, preBoardBits, _calibration, move, detRow, detCol);
-
-                      if (found) {
-                          _telemetry.liveHeldRow = detRow;
-                          _telemetry.liveHeldCol = detCol;
-                          int errRow = detRow - move.targetRow;
-                          int errCol = detCol - move.targetCol;
-
-                          if (errRow == 0 && errCol == 0) {
-                              matchedCounter++;
-                              _telemetry.statusMessage = "Khop mo phong (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") [" + std::to_string(step + 1) + "/12]";
-                              [self refreshUI];
-                              // Khi da nam gon trong hinh mo phong on dinh 3 nhip va qua it nhat ~1.5s thi co the tha hoac giu du
-                              if (matchedCounter >= 3 && step >= 6) break;
-                          } else {
-                              matchedCounter = 0;
-                              float stepR = std::clamp<float>(-errRow * 0.65f, -1.6f, 1.6f);
-                              float stepC = std::clamp<float>(-errCol * 0.65f, -1.6f, 1.6f);
-                              corrRow = std::clamp<float>(corrRow + stepR, -4.5f, 4.5f);
-                              corrCol = std::clamp<float>(corrCol + stepC, -4.5f, 4.5f);
-
-                              CGPoint newHoldPt = _touch.computeFingerHoldPoint(gameWindow, move, _calibration, corrRow, corrCol);
-                              _telemetry.statusMessage = "Tim duong (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") -> (" + std::to_string(move.targetRow + 1) + "," + std::to_string(move.targetCol + 1) + ")";
-                              [self refreshUI];
-                              _touch.mov
+              _configSubPanel.
