@@ -1109,4 +1109,452 @@ jobs:
           - (void)toggleConfigPanel {
               if (_isMinimized) return;
               _showAdvancedConfig = !_showAdvancedConfig;
-              _configSubPanel.
+              _configSubPanel.hidden = !_showAdvancedConfig;
+              _mainControlGroup.hidden = _showAdvancedConfig;
+              [_configToggleBtn setTitle:(_showAdvancedConfig ? @"Chinh" : @"Cai dat") forState:UIControlStateNormal];
+          }
+
+          - (void)handleAutoPlay { [self.controlDelegate onOverlayAutoPlayClicked]; }
+          - (void)handleGuideMode { [self.controlDelegate onOverlayGuideModeClicked]; }
+          - (void)handleStop { [self.controlDelegate onOverlayStopClicked]; }
+          - (void)handleStrategySegment:(UISegmentedControl *)seg { [self.controlDelegate onOverlayStrategyChanged:static_cast<BBAuto::PlayStrategy>(seg.selectedSegmentIndex)]; }
+          - (void)handleGainChanged:(UISlider *)s { _gainLabel.text = [NSString stringWithFormat:@"Bien keo: %.2f", s.value]; [self.controlDelegate onOverlayGainChanged:s.value]; }
+          - (void)handleLiftYChanged:(UISlider *)s { _liftYLabel.text = [NSString stringWithFormat:@"Nang Y: %.0f", s.value]; [self.controlDelegate onOverlayLiftYChanged:s.value]; }
+          - (void)handleBoardYChanged:(UISlider *)s { _boardYLabel.text = [NSString stringWithFormat:@"Ban Y: %.3f", s.value]; [self.controlDelegate onOverlayBoardYChanged:s.value]; }
+          - (void)handleBoardWChanged:(UISlider *)s { _boardWLabel.text = [NSString stringWithFormat:@"Ban W: %.3f", s.value]; [self.controlDelegate onOverlayBoardWChanged:s.value]; }
+          - (void)handleDockYChanged:(UISlider *)s { _dockYLabel.text = [NSString stringWithFormat:@"Dock Y: %.3f", s.value]; [self.controlDelegate onOverlayDockYChanged:s.value]; }
+          - (void)handleCalibToggle { [self.controlDelegate onOverlayToggleCalibrationFrame:!_guideView.currentConfig.showCalibrationOverlay]; }
+
+          - (void)updateTelemetry:(const BBAuto::RuntimeTelemetry&)telemetry runState:(BBAuto::EngineRunState)runState calibration:(const BBAuto::CalibrationConfig&)config {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  self->_guideView.currentConfig = config;
+                  self->_guideView.currentTelemetry = telemetry;
+                  self->_guideView.currentRunState = runState;
+                  [self->_guideView setNeedsDisplay];
+                  NSString* stratStr = (telemetry.effectiveStrategy == BBAuto::PlayStrategy::MAX_SURVIVAL) ? @"SURVIVAL" : @"COMBO+SURV";
+                  self->_statsLabel.text = [NSString stringWithFormat:@"Luot: %d | Xoa: %d | Combo: %d\nPA: %d | Uu tien: %@",
+                      telemetry.turnsExecuted, telemetry.totalLinesCleared, telemetry.currentCombo, telemetry.lastValidSequences, stratStr];
+                  self->_statusLabel.text = [NSString stringWithFormat:@"TT: %s", telemetry.statusMessage.c_str()];
+              });
+          }
+          @end
+
+          @interface BBAutoPlayController : NSObject <BBAutoOverlayDelegate>
+          + (instancetype)sharedInstance;
+          - (void)attachToApplicationWindow;
+          @end
+
+          @implementation BBAutoPlayController {
+              BBAutoOverlayWindow* _overlayWindow;
+              dispatch_queue_t _workerQueue;
+              BBAuto::BlockSolver _solver;
+              BBAuto::VisionAnalyzer _vision;
+              BBAuto::TouchSynthesizer _touch;
+              BBAuto::CalibrationConfig _calibration;
+              BBAuto::RuntimeTelemetry _telemetry;
+              std::atomic<BBAuto::EngineRunState> _runState;
+              std::atomic<bool> _loopActive;
+              BBAuto::TurnPlan _lockedGuidePlan;
+              int _lockedGuideStepIdx, _placementConfirmCounter;
+              uint64_t _boardBeforeGuideStep;
+          }
+
+          + (instancetype)sharedInstance {
+              static BBAutoPlayController* instance = nil;
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{ instance = [[BBAutoPlayController alloc] init]; });
+              return instance;
+          }
+
+          - (instancetype)init {
+              if (self = [super init]) {
+                  _workerQueue = dispatch_queue_create("com.autoplay.blockblast.worker", DISPATCH_QUEUE_SERIAL);
+                  _runState.store(BBAuto::EngineRunState::STOPPED);
+                  _loopActive.store(false);
+              }
+              return self;
+          }
+
+          - (UIWindow *)findActiveGameWindow {
+              __block UIWindow* foundWindow = nil;
+              auto finder = ^{
+                  NSMutableArray<UIWindow*>* allWindows = [NSMutableArray array];
+                  if (@available(iOS 13.0, *)) {
+                      for (UIScene* scene in [UIApplication sharedApplication].connectedScenes)
+                          if ([scene isKindOfClass:[UIWindowScene class]])
+                              [allWindows addObjectsFromArray:((UIWindowScene*)scene).windows];
+                  }
+                  if (allWindows.count == 0) [allWindows addObjectsFromArray:[[UIApplication sharedApplication] windows]];
+                  for (UIWindow* win in allWindows) {
+                      if (win == self->_overlayWindow) continue;
+                      if (!win.hidden && win.alpha > 0.01 && CGRectGetWidth(win.bounds) > 200) { foundWindow = win; break; }
+                  }
+              };
+              if ([NSThread isMainThread]) finder();
+              else dispatch_sync(dispatch_get_main_queue(), finder);
+              return foundWindow;
+          }
+
+          - (void)attachToApplicationWindow {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  UIWindow* gameWin = [self findActiveGameWindow];
+                  if (!gameWin) return;
+                  BOOL isNew = NO;
+                  if (!self->_overlayWindow) {
+                      self->_overlayWindow = [[BBAutoOverlayWindow alloc] initWithFrame:gameWin.bounds];
+                      self->_overlayWindow.controlDelegate = self;
+                      isNew = YES;
+                  }
+                  if (@available(iOS 13.0, *)) {
+                      if (gameWin.windowScene && self->_overlayWindow.windowScene != gameWin.windowScene)
+                          self->_overlayWindow.windowScene = gameWin.windowScene;
+                  }
+                  self->_overlayWindow.hidden = NO;
+                  if (isNew) [self refreshUI];
+              });
+          }
+
+          - (void)refreshUI {
+              if (_overlayWindow) [_overlayWindow updateTelemetry:_telemetry runState:_runState.load() calibration:_calibration];
+          }
+
+          - (void)onOverlayAutoPlayClicked {
+              _lockedGuidePlan.feasible = false;
+              _runState.store(BBAuto::EngineRunState::AUTO_PLAYING);
+              _telemetry.statusMessage = "AUTO: Keo 1.65 & tim duong 3s...";
+              [self refreshUI];
+              if (!_loopActive.exchange(true)) [self scheduleNextCycleWithDelay:0.12];
+          }
+
+          - (void)onOverlayGuideModeClicked {
+              _lockedGuidePlan.feasible = false;
+              _lockedGuideStepIdx = 0; _placementConfirmCounter = 0;
+              _runState.store(BBAuto::EngineRunState::GUIDE_PLAYING);
+              _telemetry.statusMessage = "HDAN CHOI: Mo phong chinh xac...";
+              [self refreshUI];
+              if (!_loopActive.exchange(true)) [self scheduleNextCycleWithDelay:0.10];
+          }
+
+          - (void)onOverlayStopClicked {
+              _runState.store(BBAuto::EngineRunState::STOPPED);
+              _loopActive.store(false);
+              _lockedGuidePlan.feasible = false;
+              _telemetry.hasActiveGuideMove = false;
+              _telemetry.isSteeringHold = false;
+              _telemetry.statusMessage = "Da dung";
+              [self refreshUI];
+          }
+
+          - (void)onOverlayStrategyChanged:(BBAuto::PlayStrategy)newStrategy { _telemetry.requestedStrategy = newStrategy; _lockedGuidePlan.feasible = false; [self refreshUI]; }
+          - (void)onOverlayGainChanged:(float)newGain { _calibration.dragGainX = newGain; _calibration.dragGainY = newGain; _calibration.learnedBiasRow = 0; _calibration.learnedBiasCol = 0; }
+          - (void)onOverlayLiftYChanged:(float)newLiftY { _calibration.dragLiftOffsetY = newLiftY; _calibration.learnedBiasRow = 0; }
+          - (void)onOverlayBoardYChanged:(float)newBoardY { _calibration.boardY = newBoardY; [self triggerLiveDetection]; }
+          - (void)onOverlayBoardWChanged:(float)newBoardW { _calibration.boardW = newBoardW; _calibration.boardX = (1.0f - newBoardW) * 0.5f; [self triggerLiveDetection]; }
+          - (void)onOverlayDockYChanged:(float)newDockY { _calibration.dockY = newDockY; [self triggerLiveDetection]; }
+          - (void)onOverlayToggleCalibrationFrame:(BOOL)visible { _calibration.showCalibrationOverlay = visible; [self triggerLiveDetection]; }
+
+          - (void)triggerLiveDetection {
+              dispatch_async(_workerQueue, ^{
+                  UIWindow* gameWin = [self findActiveGameWindow];
+                  if (gameWin) {
+                      BBAuto::VisionSnapshotResult snap = self->_vision.analyzeCurrentScreen(gameWin, self->_overlayWindow, self->_calibration);
+                      if (snap.success) {
+                          self->_telemetry.lastDetectedBoard = snap.boardBits;
+                          for (int i = 0; i < 3 && i < (int)snap.dockPieces.size(); ++i) self->_telemetry.lastDetectedDock[i] = snap.dockPieces[i];
+                      }
+                  }
+                  [self refreshUI];
+              });
+          }
+
+          - (BBAuto::VisionSnapshotResult)captureVerifiedSnapshot:(UIWindow *)gameWindow outRawPixels:(std::vector<BBAuto::VisionAnalyzer::RGBAPixel> &)outPixels outW:(int &)outW outH:(int &)outH {
+              outW = 360; outH = 0;
+              BBAuto::VisionSnapshotResult snap1, snap2;
+              if (!BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, outW, outH, outPixels)) return snap1;
+              snap1 = _vision.analyzePixels(outPixels, outW, outH, _calibration);
+
+              if (snap1.boardConfidence < 0.45f || BBAuto::popcount64(snap1.boardBits) >= 54 || !_solver.hasAnySingleValidMove(snap1.boardBits, snap1.dockPieces)) {
+                  [NSThread sleepForTimeInterval:0.12];
+                  std::vector<BBAuto::VisionAnalyzer::RGBAPixel> pixels2;
+                  int h2 = 0;
+                  if (BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, outW, h2, pixels2)) {
+                      snap2 = _vision.analyzePixels(pixels2, outW, h2, _calibration);
+                      if (snap2.success) {
+                          snap1.boardBits &= snap2.boardBits;
+                          outPixels = std::move(pixels2);
+                          outH = h2;
+                      }
+                  }
+              }
+              return snap1;
+          }
+
+          - (bool)executeDragAndSteer3Seconds:(UIWindow *)gameWindow
+                                         move:(const BBAuto::PlacementMove &)move
+                                 preBoardBits:(uint64_t)preBoardBits
+                                preDragPixels:(const std::vector<BBAuto::VisionAnalyzer::RGBAPixel> &)preDragPixels
+                                         bufW:(int)bufW
+                                         bufH:(int)bufH {
+              CGSize winSize = gameWindow.bounds.size;
+              CGPoint startPt = CGPointMake(move.piece.centerNormX * winSize.width, move.piece.centerNormY * winSize.height);
+              float corrRow = 0.0f, corrCol = 0.0f;
+              CGPoint holdPt = _touch.computeFingerHoldPoint(gameWindow, move, _calibration, corrRow, corrCol);
+
+              _telemetry.isSteeringHold = true;
+              _telemetry.liveHeldRow = -1;
+              _telemetry.liveHeldCol = -1;
+              _telemetry.statusMessage = "Keo len (1.65) -> Tim duong 3s...";
+              [self refreshUI];
+
+              _touch.beginAndDragToHoldPoint(gameWindow, startPt, holdPt, _calibration.dragSpeedMultiplier);
+
+              int matchedCounter = 0;
+
+              for (int step = 0; step < 12; ++step) {
+                  if (_runState.load() != BBAuto::EngineRunState::AUTO_PLAYING) {
+                      _touch.commitDropAtPoint(gameWindow, startPt);
+                      _telemetry.isSteeringHold = false;
+                      return false;
+                  }
+
+                  _touch.sendHoldHeartbeat(gameWindow, holdPt);
+                  [NSThread sleepForTimeInterval:0.12];
+                  _touch.sendHoldHeartbeat(gameWindow, holdPt);
+                  [NSThread sleepForTimeInterval:0.10];
+
+                  std::vector<BBAuto::VisionAnalyzer::RGBAPixel> liveHoldPixels;
+                  int liveH = 0;
+                  if (BBAuto::VisionAnalyzer::captureWindowPixels(gameWindow, _overlayWindow, bufW, liveH, liveHoldPixels) && liveH == bufH) {
+                      int detRow = -1, detCol = -1;
+                      bool found = _vision.detectHeldPieceOnBoard(preDragPixels, liveHoldPixels, bufW, bufH, preBoardBits, _calibration, move, detRow, detCol);
+
+                      if (found) {
+                          _telemetry.liveHeldRow = detRow;
+                          _telemetry.liveHeldCol = detCol;
+                          int errRow = detRow - move.targetRow;
+                          int errCol = detCol - move.targetCol;
+
+                          if (errRow == 0 && errCol == 0) {
+                              matchedCounter++;
+                              _telemetry.statusMessage = "Khop mo phong (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") [" + std::to_string(step + 1) + "/12]";
+                              [self refreshUI];
+                              if (matchedCounter >= 3 && step >= 6) break;
+                          } else {
+                              matchedCounter = 0;
+                              float stepR = std::clamp<float>(-errRow * 0.65f, -1.6f, 1.6f);
+                              float stepC = std::clamp<float>(-errCol * 0.65f, -1.6f, 1.6f);
+                              corrRow = std::clamp<float>(corrRow + stepR, -4.5f, 4.5f);
+                              corrCol = std::clamp<float>(corrCol + stepC, -4.5f, 4.5f);
+
+                              CGPoint newHoldPt = _touch.computeFingerHoldPoint(gameWindow, move, _calibration, corrRow, corrCol);
+                              _telemetry.statusMessage = "Tim duong (" + std::to_string(detRow + 1) + "," + std::to_string(detCol + 1) + ") -> (" + std::to_string(move.targetRow + 1) + "," + std::to_string(move.targetCol + 1) + ")";
+                              [self refreshUI];
+                              _touch.moveHeldFingerSmoothly(gameWindow, holdPt, newHoldPt, 6);
+                              holdPt = newHoldPt;
+                          }
+                      } else {
+                          _touch.sendHoldHeartbeat(gameWindow, holdPt);
+                      }
+                  }
+              }
+
+              _telemetry.isSteeringHold = false;
+              _telemetry.statusMessage = "Da khop hinh mo phong -> THA KHOI!";
+              [self refreshUI];
+              _touch.commitDropAtPoint(gameWindow, holdPt);
+
+              _calibration.learnedBiasRow = std::clamp(_calibration.learnedBiasRow + corrRow * 0.30f, -2.5f, 2.5f);
+              _calibration.learnedBiasCol = std::clamp(_calibration.learnedBiasCol + corrCol * 0.30f, -2.5f, 2.5f);
+              return true;
+          }
+
+          - (void)scheduleNextCycleWithDelay:(double)delaySeconds {
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(delaySeconds * NSEC_PER_SEC)), _workerQueue, ^{ [self executeSolverCycle]; });
+          }
+
+          - (void)executeSolverCycle {
+              BBAuto::EngineRunState mode = _runState.load();
+              if (mode == BBAuto::EngineRunState::STOPPED) { _loopActive.store(false); return; }
+              UIWindow* gameWindow = [self findActiveGameWindow];
+              if (!gameWindow) { _telemetry.statusMessage = "Cho cua so game..."; [self refreshUI]; [self scheduleNextCycleWithDelay:0.5]; return; }
+
+              std::vector<BBAuto::VisionAnalyzer::RGBAPixel> preDragPixels;
+              int bufW = 360, bufH = 0;
+              BBAuto::VisionSnapshotResult snap = [self captureVerifiedSnapshot:gameWindow outRawPixels:preDragPixels outW:bufW outH:bufH];
+              if (!snap.success) { _telemetry.statusMessage = "Loi chup man hinh"; [self refreshUI]; [self scheduleNextCycleWithDelay:0.4]; return; }
+
+              _telemetry.lastDetectedBoard = snap.boardBits;
+              _telemetry.lastBoardConfidence = snap.boardConfidence;
+              int validPiecesCount = 0;
+              for (int i = 0; i < 3 && i < (int)snap.dockPieces.size(); ++i) {
+                  _telemetry.lastDetectedDock[i] = snap.dockPieces[i];
+                  if (snap.dockPieces[i].valid) validPiecesCount++;
+              }
+
+              if (validPiecesCount == 0) {
+                  _telemetry.hasActiveGuideMove = false;
+                  _telemetry.statusMessage = "Cho game phat 3 khoi moi...";
+                  [self refreshUI];
+                  [self scheduleNextCycleWithDelay:0.25];
+                  return;
+              }
+
+              if (mode == BBAuto::EngineRunState::GUIDE_PLAYING) {
+                  if (_lockedGuidePlan.feasible && _lockedGuideStepIdx < (int)_lockedGuidePlan.moves.size()) {
+                      const BBAuto::PlacementMove& activeMv = _lockedGuidePlan.moves[_lockedGuideStepIdx];
+                      int slot = activeMv.slotIndex;
+                      bool slotEmptyNow = (slot >= 0 && slot < 3 && !snap.dockPieces[slot].valid);
+                      bool targetCellsFilled = ((snap.boardBits & activeMv.rawMaskOnBoard) == activeMv.rawMaskOnBoard);
+                      bool lineClearedMatch = (activeMv.linesCleared > 0 && snap.boardBits == activeMv.expectedBoardAfter);
+
+                      if (slotEmptyNow && (targetCellsFilled || lineClearedMatch)) {
+                          if (++_placementConfirmCounter >= 2) {
+                              _placementConfirmCounter = 0; _telemetry.movesExecuted++;
+                              if (activeMv.linesCleared > 0) { _telemetry.totalLinesCleared += activeMv.linesCleared; _telemetry.currentCombo++; _telemetry.movesSinceLastClear = 0; }
+                              else if (++_telemetry.movesSinceLastClear >= 3) _telemetry.currentCombo = 0;
+                              _lockedGuideStepIdx++; _boardBeforeGuideStep = snap.boardBits;
+                              if (_lockedGuideStepIdx < (int)_lockedGuidePlan.moves.size()) {
+                                  const auto& nextMv = _lockedGuidePlan.moves[_lockedGuideStepIdx];
+                                  _telemetry.hasActiveGuideMove = true; _telemetry.currentGuideMove = nextMv;
+                                  _telemetry.guideStepIndex = _lockedGuideStepIdx; _telemetry.guideTotalSteps = (int)_lockedGuidePlan.moves.size();
+                                  _telemetry.statusMessage = "Buoc " + std::to_string(_lockedGuideStepIdx + 1) + "/" + std::to_string(_telemetry.guideTotalSteps) + ": Keo khay " + std::to_string(nextMv.slotIndex + 1);
+                                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return;
+                              } else {
+                                  _telemetry.turnsExecuted++; _lockedGuidePlan.feasible = false; _telemetry.hasActiveGuideMove = false;
+                                  _telemetry.statusMessage = "Xong luot! Cho 3 khoi moi...";
+                                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.25]; return;
+                              }
+                          }
+                      } else if (slotEmptyNow && snap.boardBits != _boardBeforeGuideStep) {
+                          _lockedGuidePlan.feasible = false; _placementConfirmCounter = 0;
+                      } else _placementConfirmCounter = 0;
+                      if (_lockedGuidePlan.feasible) { [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return; }
+                  }
+
+                  BBAuto::TurnPlan plan = _solver.solveTurn(snap.boardBits, snap.dockPieces, _telemetry.currentCombo, _telemetry.movesSinceLastClear, _telemetry.requestedStrategy);
+                  _telemetry.effectiveStrategy = plan.activeStrategy; _telemetry.lastValidSequences = plan.validSequencesFound;
+                  if (!plan.feasible || plan.moves.empty()) {
+                      _telemetry.hasActiveGuideMove = false;
+                      _telemetry.statusMessage = "Dang kiem tra lai ban co...";
+                      [self refreshUI]; [self scheduleNextCycleWithDelay:0.35]; return;
+                  }
+                  _lockedGuidePlan = plan; _lockedGuideStepIdx = 0; _boardBeforeGuideStep = snap.boardBits; _placementConfirmCounter = 0;
+                  const auto& mv0 = _lockedGuidePlan.moves[0];
+                  _telemetry.hasActiveGuideMove = true; _telemetry.currentGuideMove = mv0; _telemetry.guideStepIndex = 0; _telemetry.guideTotalSteps = (int)_lockedGuidePlan.moves.size();
+                  _telemetry.statusMessage = "Buoc 1/" + std::to_string(_telemetry.guideTotalSteps) + ": Keo khay " + std::to_string(mv0.slotIndex + 1);
+                  [self refreshUI]; [self scheduleNextCycleWithDelay:0.15]; return;
+              }
+
+              BBAuto::TurnPlan plan = _solver.solveTurn(snap.boardBits, snap.dockPieces, _telemetry.currentCombo, _telemetry.movesSinceLastClear, _telemetry.requestedStrategy);
+              _telemetry.effectiveStrategy = plan.activeStrategy;
+              _telemetry.lastValidSequences = plan.validSequencesFound;
+
+              if (!plan.feasible || plan.moves.empty()) {
+                  _telemetry.hasActiveGuideMove = false;
+                  _telemetry.statusMessage = "Kiem tra lai ban co...";
+                  [self refreshUI];
+                  [self scheduleNextCycleWithDelay:0.45];
+                  return;
+              }
+
+              const BBAuto::PlacementMove firstMove = plan.moves.front();
+              int prevSlot = firstMove.slotIndex;
+              _telemetry.hasActiveGuideMove = true;
+              _telemetry.currentGuideMove = firstMove;
+              _telemetry.guideStepIndex = 0;
+              _telemetry.guideTotalSteps = (int)plan.moves.size();
+              [self refreshUI];
+
+              [NSThread sleepForTimeInterval:0.25];
+
+              bool dropped = [self executeDragAndSteer3Seconds:gameWindow move:firstMove preBoardBits:snap.boardBits preDragPixels:preDragPixels bufW:bufW bufH:bufH];
+              if (!dropped) {
+                  [self scheduleNextCycleWithDelay:0.30];
+                  return;
+              }
+
+              [NSThread sleepForTimeInterval:(firstMove.linesCleared > 0) ? 0.42 : 0.25];
+              if (_runState.load() != BBAuto::EngineRunState::AUTO_PLAYING) { _loopActive.store(false); return; }
+
+              BBAuto::VisionSnapshotResult postSnap = _vision.analyzeCurrentScreen(gameWindow, _overlayWindow, _calibration);
+              bool slotConsumed = (prevSlot >= 0 && prevSlot < 3 && !postSnap.dockPieces[prevSlot].valid);
+
+              if (slotConsumed || postSnap.boardBits != snap.boardBits) {
+                  if (firstMove.linesCleared == 0) {
+                      uint64_t addedBits = postSnap.boardBits & ~snap.boardBits;
+                      if (BBAuto::popcount64(addedBits) == firstMove.piece.cellCount && addedBits != firstMove.rawMaskOnBoard) {
+                          int minR = 8, minC = 8;
+                          for (int r = 0; r < 8; ++r)
+                              for (int c = 0; c < 8; ++c)
+                                  if ((addedBits >> (r * 8 + c)) & 1ULL) { minR = std::min(minR, r); minC = std::min(minC, c); }
+                          int errR = minR - firstMove.targetRow, errC = minC - firstMove.targetCol;
+                          if (std::abs(errR) <= 2 && std::abs(errC) <= 2) {
+                              _calibration.learnedBiasRow = std::clamp(_calibration.learnedBiasRow - errR * 0.55f, -2.5f, 2.5f);
+                              _calibration.learnedBiasCol = std::clamp(_calibration.learnedBiasCol - errC * 0.55f, -2.5f, 2.5f);
+                          }
+                      }
+                  }
+                  _telemetry.movesExecuted++;
+                  if (_telemetry.movesExecuted % 3 == 0) _telemetry.turnsExecuted++;
+                  if (firstMove.linesCleared > 0) { _telemetry.totalLinesCleared += firstMove.linesCleared; _telemetry.currentCombo++; _telemetry.movesSinceLastClear = 0; }
+                  else if (++_telemetry.movesSinceLastClear >= 3) _telemetry.currentCombo = 0;
+                  _telemetry.statusMessage = "Dat khop! Chuan bi khoi tiep...";
+                  [self refreshUI];
+                  [self scheduleNextCycleWithDelay:0.15];
+              } else {
+                  _telemetry.statusMessage = "Chua an khoi -> Thu lai...";
+                  [self refreshUI];
+                  [self scheduleNextCycleWithDelay:0.25];
+              }
+          }
+          @end
+
+          __attribute__((constructor))
+          static void initializeBlockBlastAutoDylib() {
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                  [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
+                      [[BBAutoPlayController sharedInstance] attachToApplicationWindow];
+                  }];
+              });
+          }
+          EOF
+
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang++ \
+            -arch arm64 \
+            -dynamiclib \
+            -std=c++17 \
+            -fobjc-arc \
+            -Wno-deprecated-declarations \
+            -O3 \
+            -mios-version-min=14.0 \
+            -isysroot "$SDK_PATH" \
+            -Wl,-install_name,@rpath/BlockBlastAuto.dylib \
+            -framework UIKit \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            BlockBlastAuto.mm \
+            -o BlockBlastAuto.dylib
+
+          codesign -f -s - BlockBlastAuto.dylib || true
+          ldid -S BlockBlastAuto.dylib || true
+          rm -f BlockBlastAuto.mm
+          ls -lh BlockBlastAuto.dylib
+
+      - name: Upload Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlockBlastAuto-dylib
+          path: BlockBlastAuto.dylib
+
+      - name: Commit BlockBlastAuto.dylib directly to Repository
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f BlockBlastAuto.dylib
+          git commit -m "Build BlockBlastAuto.dylib [skip ci]" || true
+          git pull --rebase || true
+          git push || true
